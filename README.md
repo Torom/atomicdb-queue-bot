@@ -28,7 +28,7 @@ The project is fully managed using `pyproject.toml` and `uv`:
 
 ```bash
 # Clone the repository
-git clone <repo-url>
+git clone https://github.com/Torom/atomicdb-queue-bot.git
 cd atomicdb
 
 # Install uv if not already installed
