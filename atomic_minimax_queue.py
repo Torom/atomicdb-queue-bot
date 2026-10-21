@@ -148,6 +148,18 @@ class AtomicDBClient:
         self.password = password
         self.cache: Dict[str, Optional[dict]] = {}
         self.query_count = 0
+        self.last_request_time = 0.0
+
+    def _rate_limit(self, min_interval: float = 0.21):
+        """
+        Enforces a minimum interval between requests (default: 0.21s = ~4.76 req/s)
+        to stay safely within Nginx's rate limit of 5 req/s regardless of network RTT.
+        """
+        now = time.perf_counter()
+        elapsed = now - self.last_request_time
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        self.last_request_time = time.perf_counter()
 
     def query(self, fen: str, bypass_cache: bool = False) -> Optional[dict]:
         """
@@ -162,9 +174,8 @@ class AtomicDBClient:
         req = urllib.request.Request(url, headers={'User-Agent': 'AtomicMinimaxQueueBot/1.0'})
         self.query_count += 1
 
-        # Rate limiting: Thanks to Nginx burst=50 and ~120ms network RTT, 0.08s suffices
-        # to achieve an effective rate of ~4.8 req/s (without unnecessary throttling).
-        time.sleep(0.08)
+        # Dynamic rate limiting: Enforces <= 4.76 req/s to comply with server rate=5r/s
+        self._rate_limit(0.21)
 
         retries = 3
         while retries > 0:
@@ -224,7 +235,8 @@ class AtomicDBClient:
             }
         )
 
-        time.sleep(0.10)
+        # Dynamic rate limiting: Enforces <= 4.76 req/s to comply with server rate=5r/s
+        self._rate_limit(0.21)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode('utf-8'))
@@ -256,6 +268,7 @@ class AtomicDBClient:
             data=post_data,
             headers={'User-Agent': 'AtomicMinimaxQueueBot/1.0'}
         )
+        self._rate_limit(0.21)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
@@ -286,6 +299,7 @@ class AtomicDBClient:
         """
         url = f"{self.base_url}/api/live-request/{key}/"
         req = urllib.request.Request(url, headers={'User-Agent': 'AtomicMinimaxQueueBot/1.0'})
+        self._rate_limit(0.21)
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode('utf-8'))
@@ -319,6 +333,7 @@ class AtomicDBClient:
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
         )
+        self._rate_limit(0.21)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode('utf-8'))
@@ -1073,7 +1088,6 @@ def wait_for_completion(
         for key, task in check_batch:
             fen = task.get('fen', '')
             if fen:
-                time.sleep(0.25)  # Compliance with Nginx rate limit (5 r/s)
                 data = client.query(fen, bypass_cache=True)
                 if data and (data.get('visits', 0) > 0 or data.get('status', 'UNKNOWN') != 'UNKNOWN'):
                     finished_keys.append(key)
