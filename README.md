@@ -29,7 +29,7 @@ The project is fully managed using `pyproject.toml` and `uv`:
 ```bash
 # Clone the repository
 git clone https://github.com/Torom/atomicdb-queue-bot.git
-cd atomicdb
+cd atomicdb-queue-bot
 
 # Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
