@@ -21,9 +21,11 @@ How it works:
 
 import argparse
 import hashlib
+import http.client
 import json
 import logging
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -140,15 +142,45 @@ class LeafCandidate:
 
 
 class AtomicDBClient:
-    """Client for the AtomicDB HTTP API."""
+    """Client for the AtomicDB HTTP API with persistent HTTP/1.1 Keep-Alive connection pooling."""
 
     def __init__(self, base_url: str = DEFAULT_SERVER, username: str = "", password: str = ""):
         self.base_url = base_url.rstrip('/')
+        parsed = urllib.parse.urlparse(self.base_url)
+        self.scheme = parsed.scheme.lower() if parsed.scheme else 'https'
+        self.host = parsed.netloc
+        self.path_prefix = parsed.path.rstrip('/')
         self.username = username
         self.password = password
         self.cache: Dict[str, Optional[dict]] = {}
         self.query_count = 0
         self.last_request_time = 0.0
+        self.ssl_context = ssl.create_default_context() if self.scheme == 'https' else None
+        self._conn: Optional[http.client.HTTPConnection] = None
+
+    def _get_connection(self, timeout: float = 15.0) -> http.client.HTTPConnection:
+        if self._conn is None:
+            if self.scheme == 'https':
+                self._conn = http.client.HTTPSConnection(
+                    self.host, timeout=timeout, context=self.ssl_context
+                )
+            else:
+                self._conn = http.client.HTTPConnection(
+                    self.host, timeout=timeout
+                )
+        return self._conn
+
+    def _close_connection(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def close(self):
+        """Closes the underlying persistent HTTP connection."""
+        self._close_connection()
 
     def _rate_limit(self, min_interval: float = 0.21):
         """
@@ -161,6 +193,47 @@ class AtomicDBClient:
             time.sleep(min_interval - elapsed)
         self.last_request_time = time.perf_counter()
 
+    def _http_request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        timeout: float = 15.0
+    ) -> Tuple[int, str, Dict[str, str], bytes]:
+        """
+        Executes an HTTP request reusing the persistent Keep-Alive connection.
+        Automatically reconnects if the socket was dropped by the server (e.g. idle timeout).
+        """
+        self._rate_limit(0.21)
+
+        full_path = f"{self.path_prefix}/{path.lstrip('/')}"
+        req_headers = {
+            'User-Agent': 'AtomicMinimaxQueueBot/1.0',
+            'Connection': 'keep-alive',
+        }
+        if headers:
+            req_headers.update(headers)
+
+        body_bytes = None
+        if data is not None:
+            body_bytes = urllib.parse.urlencode(data).encode('utf-8')
+            req_headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+
+        for attempt in range(2):
+            conn = self._get_connection(timeout)
+            try:
+                conn.request(method, full_path, body=body_bytes, headers=req_headers)
+                resp = conn.getresponse()
+                raw_data = resp.read()
+                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                return resp.status, resp.reason, resp_headers, raw_data
+            except (http.client.HTTPException, ConnectionError, OSError):
+                self._close_connection()
+                if attempt == 0:
+                    continue
+                raise
+
     def query(self, fen: str, bypass_cache: bool = False) -> Optional[dict]:
         """
         Queries status and moves of a position (GET /atomicdb/api/query?fen=...).
@@ -170,32 +243,28 @@ class AtomicDBClient:
         if not bypass_cache and fen in self.cache:
             return self.cache[fen]
 
-        url = f"{self.base_url}/api/query?fen={urllib.parse.quote(fen)}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'AtomicMinimaxQueueBot/1.0'})
         self.query_count += 1
-
-        # Dynamic rate limiting: Enforces <= 4.76 req/s to comply with server rate=5r/s
-        self._rate_limit(0.21)
+        path = f"/api/query?fen={urllib.parse.quote(fen)}"
 
         retries = 3
         while retries > 0:
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode('utf-8'))
+                status, reason, hdrs, body = self._http_request('GET', path, timeout=15.0)
+                if status == 200:
+                    data = json.loads(body.decode('utf-8'))
                     self.cache[fen] = data
                     return data
-            except urllib.error.HTTPError as e:
-                if e.code == 404:
+                elif status == 404:
                     self.cache[fen] = None
                     return None
-                elif e.code in (429, 503):
-                    retry_after = int(e.headers.get('Retry-After', '2'))
-                    logger.warning(f"HTTP {e.code} ({e.reason}) from server. Waiting {retry_after}s...")
+                elif status in (429, 503):
+                    retry_after = int(hdrs.get('retry-after', '2'))
+                    logger.warning(f"HTTP {status} ({reason}) from server. Waiting {retry_after}s...")
                     time.sleep(retry_after)
                     retries -= 1
                     continue
                 else:
-                    logger.error(f"HTTP error {e.code} querying {fen}: {e.reason}")
+                    logger.error(f"HTTP error {status} querying {fen}: {reason}")
                     return None
             except Exception as e:
                 logger.error(f"Network error querying {fen}: {e}")
@@ -214,8 +283,6 @@ class AtomicDBClient:
         Queues a position for analysis (POST /atomicdb/api/request).
         """
         fen = canonicalize_fen(fen)
-        url = f"{self.base_url}/api/request"
-
         post_data = {'fen': fen}
         if only_if_missing:
             post_data['only_if_missing'] = '1'
@@ -225,31 +292,16 @@ class AtomicDBClient:
         if budget is not None:
             post_data['budget'] = str(budget)
 
-        encoded_data = urllib.parse.urlencode(post_data).encode('utf-8')
-        req = urllib.request.Request(
-            url,
-            data=encoded_data,
-            headers={
-                'User-Agent': 'AtomicMinimaxQueueBot/1.0',
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-        )
-
-        # Dynamic rate limiting: Enforces <= 4.76 req/s to comply with server rate=5r/s
-        self._rate_limit(0.21)
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
+            status, reason, hdrs, body = self._http_request('POST', '/api/request', data=post_data, timeout=15.0)
             try:
-                body = e.read().decode('utf-8')
-                return json.loads(body)
+                return json.loads(body.decode('utf-8'))
             except Exception:
-                return {'status': 'http_error', 'code': e.code, 'reason': e.reason}
+                return {'status': 'http_error', 'code': status, 'reason': reason}
         except Exception as e:
             return {'status': 'error', 'reason': str(e)}
 
-    def my_queue(self) -> List[dict]:
+    def my_queue(self) -> Optional[List[dict]]:
         """
         Retrieves the account's task list (POST /atomicdb/api/my-queue/).
         Returns the list of tasks (found under 'tasks' in the server response).
@@ -257,21 +309,14 @@ class AtomicDBClient:
         if not self.username or not self.password:
             return []
 
-        url = f"{self.base_url}/api/my-queue/"
-        post_data = urllib.parse.urlencode({
+        post_data = {
             'username': self.username,
             'password': self.password
-        }).encode('utf-8')
-
-        req = urllib.request.Request(
-            url,
-            data=post_data,
-            headers={'User-Agent': 'AtomicMinimaxQueueBot/1.0'}
-        )
-        self._rate_limit(0.21)
+        }
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
+            status, reason, hdrs, body = self._http_request('POST', '/api/my-queue/', data=post_data, timeout=15.0)
+            if status == 200:
+                data = json.loads(body.decode('utf-8'))
                 if isinstance(data, dict):
                     if 'error' in data:
                         logger.warning(f"my-queue reported error: {data['error']}")
@@ -280,14 +325,14 @@ class AtomicDBClient:
                 elif isinstance(data, list):
                     return data
                 return []
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 503):
-                retry_after = int(e.headers.get('Retry-After', '2')) if e.headers else 2
-                logger.warning(f"HTTP {e.code} ({e.reason}) on my-queue. Waiting {retry_after}s...")
+            elif status in (429, 503):
+                retry_after = int(hdrs.get('retry-after', '2'))
+                logger.warning(f"HTTP {status} ({reason}) on my-queue. Waiting {retry_after}s...")
                 time.sleep(retry_after)
+                return None
             else:
-                logger.warning(f"HTTP {e.code} on my-queue: {e.reason}")
-            return None
+                logger.warning(f"HTTP {status} on my-queue: {reason}")
+                return None
         except Exception as e:
             logger.warning(f"Could not retrieve 'my-queue' ({e}). Retrying in next interval...")
             return None
@@ -297,16 +342,13 @@ class AtomicDBClient:
         Queries the live status of a task (GET /atomicdb/api/live-request/<key>/).
         Returns e.g. {'live': True, 'text': ..., 'chip': ...} or {'live': False}.
         """
-        url = f"{self.base_url}/api/live-request/{key}/"
-        req = urllib.request.Request(url, headers={'User-Agent': 'AtomicMinimaxQueueBot/1.0'})
-        self._rate_limit(0.21)
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
+            status, reason, hdrs, body = self._http_request('GET', f"/api/live-request/{key}/", timeout=10.0)
+            if status == 200:
+                return json.loads(body.decode('utf-8'))
+            elif status == 404:
                 return {'live': False}
-            logger.warning(f"Error in live-request for {key}: {e}")
+            logger.warning(f"HTTP {status} in live-request for {key}: {reason}")
             return None
         except Exception as e:
             logger.warning(f"Error in live-request for {key}: {e}")
@@ -319,24 +361,13 @@ class AtomicDBClient:
         if not self.username or not self.password:
             return {'status': 'unauthorized', 'reason': 'No credentials provided'}
 
-        url = f"{self.base_url}/api/queue-cancel/{task_id}/"
-        post_data = urllib.parse.urlencode({
+        post_data = {
             'username': self.username,
             'password': self.password
-        }).encode('utf-8')
-
-        req = urllib.request.Request(
-            url,
-            data=post_data,
-            headers={
-                'User-Agent': 'AtomicMinimaxQueueBot/1.0',
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-        )
-        self._rate_limit(0.21)
+        }
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode('utf-8'))
+            status, reason, hdrs, body = self._http_request('POST', f"/api/queue-cancel/{task_id}/", data=post_data, timeout=15.0)
+            return json.loads(body.decode('utf-8'))
         except Exception as e:
             return {'status': 'error', 'reason': str(e)}
 
@@ -1266,73 +1297,76 @@ def main():
         min_score=args.min_score
     )
 
-    if args.mode == "once":
-        run_cycle(
-            client=client,
-            explorer=explorer,
-            root_fen=effective_root_fen,
-            max_queue=args.max_leaves,
-            budget=target_budget,
-            max_allowed_budget=max_allowed_budget,
-            dry_run=args.dry_run
-        )
-    else:
-        logger.info("Starting reactive monitoring loop...")
-        while True:
-            try:
-                tracked_tasks = run_cycle(
-                    client=client,
-                    explorer=explorer,
-                    root_fen=effective_root_fen,
-                    max_queue=args.max_leaves,
-                    budget=target_budget,
-                    max_allowed_budget=max_allowed_budget,
-                    dry_run=args.dry_run
-                )
+    try:
+        if args.mode == "once":
+            run_cycle(
+                client=client,
+                explorer=explorer,
+                root_fen=effective_root_fen,
+                max_queue=args.max_leaves,
+                budget=target_budget,
+                max_allowed_budget=max_allowed_budget,
+                dry_run=args.dry_run
+            )
+        else:
+            logger.info("Starting reactive monitoring loop...")
+            while True:
+                try:
+                    tracked_tasks = run_cycle(
+                        client=client,
+                        explorer=explorer,
+                        root_fen=effective_root_fen,
+                        max_queue=args.max_leaves,
+                        budget=target_budget,
+                        max_allowed_budget=max_allowed_budget,
+                        dry_run=args.dry_run
+                    )
 
-                if args.dry_run:
-                    logger.info(f"Dry run: Pausing {args.idle_interval}s before next check...")
+                    if args.dry_run:
+                        logger.info(f"Dry run: Pausing {args.idle_interval}s before next check...")
+                        time.sleep(args.idle_interval)
+                        continue
+
+                    if not tracked_tasks:
+                        if client.username and client.password:
+                            user_tasks = client.my_queue()
+                            if user_tasks:
+                                logger.info(
+                                    f"{len(user_tasks)} active task(s) found in 'my-queue'. "
+                                    "Waiting for completion..."
+                                )
+                                wait_for_completion(
+                                    client=client,
+                                    tracked_tasks=[
+                                        {'task_id': t.get('task_id'), 'key': t.get('position')}
+                                        for t in user_tasks if isinstance(t, dict)
+                                    ],
+                                    poll_interval=args.poll_interval,
+                                    max_wait=args.max_wait
+                                )
+                                continue
+
+                        logger.info(f"No active tasks to monitor. Waiting {args.idle_interval}s before next check...")
+                        time.sleep(args.idle_interval)
+                        continue
+
+                    # Dynamically and reactively wait for completion of tasks!
+                    wait_for_completion(
+                        client=client,
+                        tracked_tasks=tracked_tasks,
+                        poll_interval=args.poll_interval,
+                        max_wait=args.max_wait
+                    )
+                    logger.info("Starting next minimax cycle immediately...")
+
+                except KeyboardInterrupt:
+                    logger.info("Terminated by user.")
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error in cycle: {e}", exc_info=True)
                     time.sleep(args.idle_interval)
-                    continue
-
-                if not tracked_tasks:
-                    if client.username and client.password:
-                        user_tasks = client.my_queue()
-                        if user_tasks:
-                            logger.info(
-                                f"{len(user_tasks)} active task(s) found in 'my-queue'. "
-                                "Waiting for completion..."
-                            )
-                            wait_for_completion(
-                                client=client,
-                                tracked_tasks=[
-                                    {'task_id': t.get('task_id'), 'key': t.get('position')}
-                                    for t in user_tasks if isinstance(t, dict)
-                                ],
-                                poll_interval=args.poll_interval,
-                                max_wait=args.max_wait
-                            )
-                            continue
-
-                    logger.info(f"No active tasks to monitor. Waiting {args.idle_interval}s before next check...")
-                    time.sleep(args.idle_interval)
-                    continue
-
-                # Dynamically and reactively wait for completion of tasks!
-                wait_for_completion(
-                    client=client,
-                    tracked_tasks=tracked_tasks,
-                    poll_interval=args.poll_interval,
-                    max_wait=args.max_wait
-                )
-                logger.info("Starting next minimax cycle immediately...")
-
-            except KeyboardInterrupt:
-                logger.info("Terminated by user.")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error in cycle: {e}", exc_info=True)
-                time.sleep(args.idle_interval)
+    finally:
+        client.close()
 
 
 if __name__ == '__main__':
