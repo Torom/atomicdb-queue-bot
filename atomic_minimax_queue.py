@@ -21,19 +21,16 @@ How it works:
 
 import argparse
 import hashlib
-import http.client
 import json
 import logging
 import os
-import ssl
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+import requests
 
 # Import chess.variant (with automatic virtual environment detection)
 try:
@@ -142,45 +139,24 @@ class LeafCandidate:
 
 
 class AtomicDBClient:
-    """Client for the AtomicDB HTTP API with persistent HTTP/1.1 Keep-Alive connection pooling."""
+    """Client for the AtomicDB HTTP API using requests.Session with connection pooling."""
 
     def __init__(self, base_url: str = DEFAULT_SERVER, username: str = "", password: str = ""):
         self.base_url = base_url.rstrip('/')
-        parsed = urllib.parse.urlparse(self.base_url)
-        self.scheme = parsed.scheme.lower() if parsed.scheme else 'https'
-        self.host = parsed.netloc
-        self.path_prefix = parsed.path.rstrip('/')
         self.username = username
         self.password = password
         self.cache: Dict[str, Optional[dict]] = {}
         self.query_count = 0
         self.last_request_time = 0.0
-        self.ssl_context = ssl.create_default_context() if self.scheme == 'https' else None
-        self._conn: Optional[http.client.HTTPConnection] = None
 
-    def _get_connection(self, timeout: float = 15.0) -> http.client.HTTPConnection:
-        if self._conn is None:
-            if self.scheme == 'https':
-                self._conn = http.client.HTTPSConnection(
-                    self.host, timeout=timeout, context=self.ssl_context
-                )
-            else:
-                self._conn = http.client.HTTPConnection(
-                    self.host, timeout=timeout
-                )
-        return self._conn
-
-    def _close_connection(self):
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'AtomicMinimaxQueueBot/1.0',
+        })
 
     def close(self):
-        """Closes the underlying persistent HTTP connection."""
-        self._close_connection()
+        """Closes the underlying requests session."""
+        self.session.close()
 
     def _rate_limit(self, min_interval: float = 0.21):
         """
@@ -193,47 +169,6 @@ class AtomicDBClient:
             time.sleep(min_interval - elapsed)
         self.last_request_time = time.perf_counter()
 
-    def _http_request(
-        self,
-        method: str,
-        path: str,
-        data: Optional[dict] = None,
-        headers: Optional[dict] = None,
-        timeout: float = 15.0
-    ) -> Tuple[int, str, Dict[str, str], bytes]:
-        """
-        Executes an HTTP request reusing the persistent Keep-Alive connection.
-        Automatically reconnects if the socket was dropped by the server (e.g. idle timeout).
-        """
-        self._rate_limit(0.21)
-
-        full_path = f"{self.path_prefix}/{path.lstrip('/')}"
-        req_headers = {
-            'User-Agent': 'AtomicMinimaxQueueBot/1.0',
-            'Connection': 'keep-alive',
-        }
-        if headers:
-            req_headers.update(headers)
-
-        body_bytes = None
-        if data is not None:
-            body_bytes = urllib.parse.urlencode(data).encode('utf-8')
-            req_headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
-
-        for attempt in range(2):
-            conn = self._get_connection(timeout)
-            try:
-                conn.request(method, full_path, body=body_bytes, headers=req_headers)
-                resp = conn.getresponse()
-                raw_data = resp.read()
-                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
-                return resp.status, resp.reason, resp_headers, raw_data
-            except (http.client.HTTPException, ConnectionError, OSError):
-                self._close_connection()
-                if attempt == 0:
-                    continue
-                raise
-
     def query(self, fen: str, bypass_cache: bool = False) -> Optional[dict]:
         """
         Queries status and moves of a position (GET /atomicdb/api/query?fen=...).
@@ -244,29 +179,30 @@ class AtomicDBClient:
             return self.cache[fen]
 
         self.query_count += 1
-        path = f"/api/query?fen={urllib.parse.quote(fen)}"
+        url = f"{self.base_url}/api/query"
 
         retries = 3
         while retries > 0:
+            self._rate_limit(0.21)
             try:
-                status, reason, hdrs, body = self._http_request('GET', path, timeout=15.0)
-                if status == 200:
-                    data = json.loads(body.decode('utf-8'))
+                resp = self.session.get(url, params={'fen': fen}, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
                     self.cache[fen] = data
                     return data
-                elif status == 404:
+                elif resp.status_code == 404:
                     self.cache[fen] = None
                     return None
-                elif status in (429, 503):
-                    retry_after = int(hdrs.get('retry-after', '2'))
-                    logger.warning(f"HTTP {status} ({reason}) from server. Waiting {retry_after}s...")
+                elif resp.status_code in (429, 503):
+                    retry_after = int(resp.headers.get('Retry-After', '2'))
+                    logger.warning(f"HTTP {resp.status_code} ({resp.reason}) from server. Waiting {retry_after}s...")
                     time.sleep(retry_after)
                     retries -= 1
                     continue
                 else:
-                    logger.error(f"HTTP error {status} querying {fen}: {reason}")
+                    logger.error(f"HTTP error {resp.status_code} querying {fen}: {resp.reason}")
                     return None
-            except Exception as e:
+            except requests.RequestException as e:
                 logger.error(f"Network error querying {fen}: {e}")
                 time.sleep(1)
                 retries -= 1
@@ -292,13 +228,15 @@ class AtomicDBClient:
         if budget is not None:
             post_data['budget'] = str(budget)
 
+        self._rate_limit(0.21)
+        url = f"{self.base_url}/api/request"
         try:
-            status, reason, hdrs, body = self._http_request('POST', '/api/request', data=post_data, timeout=15.0)
+            resp = self.session.post(url, data=post_data, timeout=15)
             try:
-                return json.loads(body.decode('utf-8'))
+                return resp.json()
             except Exception:
-                return {'status': 'http_error', 'code': status, 'reason': reason}
-        except Exception as e:
+                return {'status': 'http_error', 'code': resp.status_code, 'reason': resp.reason}
+        except requests.RequestException as e:
             return {'status': 'error', 'reason': str(e)}
 
     def my_queue(self) -> Optional[List[dict]]:
@@ -313,10 +251,12 @@ class AtomicDBClient:
             'username': self.username,
             'password': self.password
         }
+        self._rate_limit(0.21)
+        url = f"{self.base_url}/api/my-queue/"
         try:
-            status, reason, hdrs, body = self._http_request('POST', '/api/my-queue/', data=post_data, timeout=15.0)
-            if status == 200:
-                data = json.loads(body.decode('utf-8'))
+            resp = self.session.post(url, data=post_data, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
                 if isinstance(data, dict):
                     if 'error' in data:
                         logger.warning(f"my-queue reported error: {data['error']}")
@@ -325,15 +265,15 @@ class AtomicDBClient:
                 elif isinstance(data, list):
                     return data
                 return []
-            elif status in (429, 503):
-                retry_after = int(hdrs.get('retry-after', '2'))
-                logger.warning(f"HTTP {status} ({reason}) on my-queue. Waiting {retry_after}s...")
+            elif resp.status_code in (429, 503):
+                retry_after = int(resp.headers.get('Retry-After', '2'))
+                logger.warning(f"HTTP {resp.status_code} ({resp.reason}) on my-queue. Waiting {retry_after}s...")
                 time.sleep(retry_after)
                 return None
             else:
-                logger.warning(f"HTTP {status} on my-queue: {reason}")
+                logger.warning(f"HTTP {resp.status_code} on my-queue: {resp.reason}")
                 return None
-        except Exception as e:
+        except requests.RequestException as e:
             logger.warning(f"Could not retrieve 'my-queue' ({e}). Retrying in next interval...")
             return None
 
@@ -342,15 +282,17 @@ class AtomicDBClient:
         Queries the live status of a task (GET /atomicdb/api/live-request/<key>/).
         Returns e.g. {'live': True, 'text': ..., 'chip': ...} or {'live': False}.
         """
+        self._rate_limit(0.21)
+        url = f"{self.base_url}/api/live-request/{key}/"
         try:
-            status, reason, hdrs, body = self._http_request('GET', f"/api/live-request/{key}/", timeout=10.0)
-            if status == 200:
-                return json.loads(body.decode('utf-8'))
-            elif status == 404:
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 404:
                 return {'live': False}
-            logger.warning(f"HTTP {status} in live-request for {key}: {reason}")
+            logger.warning(f"HTTP {resp.status_code} in live-request for {key}: {resp.reason}")
             return None
-        except Exception as e:
+        except requests.RequestException as e:
             logger.warning(f"Error in live-request for {key}: {e}")
             return None
 
@@ -365,10 +307,12 @@ class AtomicDBClient:
             'username': self.username,
             'password': self.password
         }
+        self._rate_limit(0.21)
+        url = f"{self.base_url}/api/queue-cancel/{task_id}/"
         try:
-            status, reason, hdrs, body = self._http_request('POST', f"/api/queue-cancel/{task_id}/", data=post_data, timeout=15.0)
-            return json.loads(body.decode('utf-8'))
-        except Exception as e:
+            resp = self.session.post(url, data=post_data, timeout=15)
+            return resp.json()
+        except requests.RequestException as e:
             return {'status': 'error', 'reason': str(e)}
 
 
