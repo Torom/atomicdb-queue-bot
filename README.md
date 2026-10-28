@@ -24,17 +24,32 @@ Because leaves are submitted immediately as they are discovered during tree trav
 
 ## Installation & Setup with `uv`
 
-The project is fully managed using `pyproject.toml` and `uv`:
+The project is fully managed using `pyproject.toml` and [`uv`](https://docs.astral.sh/uv/).
+
+### 1. Install `uv` (if not already installed)
+
+**Linux / macOS:**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+*(Alternatively on Windows via winget: `winget install --id=astral-sh.uv -e`)*
+
+> [!NOTE]
+> On Windows, restart your terminal after installation so that `uv` is added to your `PATH`.
+
+### 2. Clone Repository & Setup Environment
 
 ```bash
 # Clone the repository
 git clone https://github.com/Torom/atomicdb-queue-bot.git
 cd atomicdb-queue-bot
 
-# Install uv if not already installed
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Sync dependencies into the virtual environment
+# Automatically create virtual environment and install all dependencies
 uv sync
 ```
 
