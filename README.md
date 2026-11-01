@@ -12,13 +12,14 @@ Because leaves are submitted immediately as they are discovered during tree trav
 
 ### Key Features
 
-1. **Live Queue Submissions**: Discovered leaf nodes are submitted directly, minimizing worker idle time.
-2. **Near-Tie Exploration (`margin`)**: The tree frequently features moves that share the top score or differ by only a few centipawns. The bot explores these near-optimal alternatives within a configurable margin.
-3. **Game-Theoretic AND/OR Proof Search (`and_or`)**: When solving an advantage (e.g. White winning after `1. Nf3`), the attacker (OR node) plays the best moves while the defender (AND node) must have every legal response refuted. The bot systematically identifies and refutes defensive tries.
-4. **Cycle & Transposition Handling**: Detects repetition loops in the database and breaks cycles cleanly (`cycle_exit`) by queuing unanalyzed alternative moves.
-5. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
-6. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
-7. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
+1. **Automated Record Breaking (`target`, Default)**: Automatically queries the all-time highest evaluation from the official API (`GET /atomicdb/api/roots`) and sets `target = record + 1 cp`. It isolates the exact bottleneck leaf nodes of the critical principal variations holding down the score, logs achievement celebrations, and dynamically advances to the next record.
+2. **Live Queue Submissions**: Discovered leaf nodes are submitted directly, minimizing worker idle time.
+3. **Near-Tie Exploration (`margin`)**: The tree frequently features moves that share the top score or differ by only a few centipawns. The bot explores these near-optimal alternatives within a configurable margin.
+4. **Game-Theoretic AND/OR Proof Search (`and_or`)**: When solving an advantage (e.g. White winning after `1. Nf3`), the attacker (OR node) plays the best moves while the defender (AND node) must have every legal response refuted. The bot systematically identifies and refutes defensive tries.
+5. **Cycle & Transposition Handling**: Detects repetition loops in the database and breaks cycles cleanly (`cycle_exit`) by queuing unanalyzed alternative moves.
+6. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
+7. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
+8. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
 
 ---
 
@@ -72,7 +73,19 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
 
 ### 2. Search Strategies
 
-- **`--strategy margin` (Default, recommended for general analysis)**:
+- **`--strategy target` (Default, Proof-Frontier / Record Breaking)**:
+  Directly aims to break or achieve a target score (by default auto-fetched as `highest_score + 1` from `/atomicdb/api/roots`).
+  For White (attacker), it explores top winning candidates. For Black (defender), it explores **all** unrefuted defenses that hold White below the target score, cutting off branches that already reach the target.
+  Once the target score is achieved in daemon mode, it logs success and automatically advances to the next record!
+  ```bash
+  # Auto-fetch record from API (e.g. +1255 cp) and queue all leaves needed to reach +1256 cp:
+  uv run atomic_minimax_queue.py
+
+  # Or specify an explicit target score:
+  uv run atomic_minimax_queue.py --target-score 1260
+  ```
+
+- **`--strategy margin` (Relative Margin Exploration)**:
   Explores all branches within a centipawn margin (`--margin-cp 10` by default) of the best move at each ply.
   ```bash
   uv run atomic_minimax_queue.py --strategy margin --margin-cp 10
@@ -142,9 +155,10 @@ You can anchor the search at any line or defense variation:
 |---|---|---|
 | `--fen` | Start position | Root FEN position for tree traversal |
 | `--moves` | `None` | Initial move sequence in UCI or SAN (`"1. Nf3 f6"`) to set root position |
-| `--strategy` | `margin` | Traversal strategy (`margin` [default], `exact`, `and_or`) |
-| `--margin-cp` | `10` | Centipawn tolerance for near-ties (used by `margin` and `and_or`) |
-| `--defender-branching`| `3` | Max defensive moves per AND node (in `and_or` strategy) |
+| `--strategy` | `target` | Traversal strategy (`target` [default], `margin`, `exact`, `and_or`) |
+| `--target-score` | `auto` | Target minimax score in cp (`auto` [default: fetches API record + 1 cp] or explicit integer) |
+| `--margin-cp` | `0` | Centipawn tolerance for near-ties (`0` = strictly best move in `target` mode; `10` in `margin` mode) |
+| `--defender-branching`| `0` | Max defensive moves per AND node (`0` = unlimited [default for `target`], `3` for `and_or`) |
 | `--max-depth` | `0` | Max search depth in plies (`0` = unlimited) |
 | `--max-leaves` | `0` | Max leaves to queue per cycle (`0` = unlimited) |
 | `--max-queries` | `0` | Max API queries per cycle (`0` = unlimited) |

@@ -315,6 +315,46 @@ class AtomicDBClient:
         except requests.RequestException as e:
             return {'status': 'error', 'reason': str(e)}
 
+    def get_roots_extremes(self) -> Optional[dict]:
+        """
+        Retrieves root and opening record extremes (GET /atomicdb/api/roots).
+        Returns the parsed JSON response or None on error.
+        """
+        self._rate_limit(0.21)
+        url = f"{self.base_url}/api/roots"
+        try:
+            resp = self.session.get(url, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning(f"HTTP {resp.status_code} in /api/roots: {resp.reason}")
+            return None
+        except requests.RequestException as e:
+            logger.warning(f"Error fetching /api/roots: {e}")
+            return None
+
+    def get_position_record(
+        self,
+        key: Optional[str] = None,
+        fen: Optional[str] = None
+    ) -> Optional[dict]:
+        """
+        Finds the record extreme for a given position key or FEN in /api/roots.
+        Returns a dictionary with 'key', 'label', 'value', 'best_value', 'worst_value', etc.
+        """
+        data = self.get_roots_extremes()
+        if not data:
+            return None
+
+        target_key = key
+        if not target_key and fen:
+            target_key = key_of(fen)
+
+        all_positions = data.get('positions', []) + data.get('openings', [])
+        for p in all_positions:
+            if target_key and p.get('key') == target_key:
+                return p
+        return None
+
 
 class MinimaxFrontierExplorer:
     """Traverses the game tree and determines critical leaf nodes."""
@@ -322,9 +362,10 @@ class MinimaxFrontierExplorer:
     def __init__(
         self,
         client: AtomicDBClient,
-        strategy: str = "margin",
+        strategy: str = "target",
+        target_score: Optional[int] = None,
         margin_cp: int = 10,
-        defender_branching: int = 3,
+        defender_branching: int = 0,
         max_depth: int = 0,
         max_leaves: int = 0,
         max_queries: int = 0,
@@ -333,6 +374,7 @@ class MinimaxFrontierExplorer:
     ):
         self.client = client
         self.strategy = strategy
+        self.target_score = target_score
         self.margin_cp = margin_cp
         self.defender_branching = defender_branching
         self.max_depth = max_depth  # 0 = unlimited
@@ -768,7 +810,34 @@ class MinimaxFrontierExplorer:
             # and was devalued by server backpropagation), orient margin on node_score:
             best_score = min(best_score, node_score)
 
-        if self.strategy == "exact":
+        if self.strategy == "target":
+            # Proof-frontier search for target score:
+            # Attacker (root_stm): Follow the best move (max score) that establishes the record.
+            # Defender (!= root_stm): Follow only SCORED moves where the opponent holds White below target
+            # (m['score'] > -target). Unopened/unsearched moves at intermediate plies are ignored because
+            # engine search already pruned them and the DB does not require them for backpropagation.
+            target = self.target_score if self.target_score is not None else 1
+            if stm == root_stm:
+                margin_tol = self.margin_cp if self.margin_cp > 0 else 0
+                selected = [
+                    m for m in scored_moves
+                    if m['score'] >= best_score - margin_tol and m.get('status') == 'UNKNOWN'
+                ]
+                if not selected and best_move:
+                    selected = [m for m in scored_moves if m['uci'] == best_move]
+            else:
+                candidates = [
+                    m for m in scored_moves
+                    if m.get('status') == 'UNKNOWN' and m['score'] > -target
+                ]
+                if not candidates:
+                    return []
+
+                candidates.sort(key=lambda m: m['score'], reverse=True)
+                if self.defender_branching > 0:
+                    candidates = candidates[:self.defender_branching]
+                selected = candidates
+        elif self.strategy == "exact":
             # Strict best score
             selected = [
                 m for m in scored_moves
@@ -823,7 +892,10 @@ class MinimaxFrontierExplorer:
             selected = [m for m in moves if m['uci'] == best_move]
 
         if best_move and len(selected) > 1:
-            selected.sort(key=lambda m: (m.get('uci') != best_move, -m.get('score', -99999)))
+            selected.sort(key=lambda m: (
+                m.get('uci') != best_move,
+                -(m.get('score') if m.get('score') is not None else -99999)
+            ))
 
         return selected
 
@@ -1117,18 +1189,29 @@ def parse_arguments():
     )
     parser.add_argument(
         "--strategy",
-        choices=["margin", "exact", "and_or"],
-        default="margin",
-        help="Search strategy: 'margin' (default: all moves within margin-cp), "
+        choices=["target", "margin", "exact", "and_or"],
+        default="target",
+        help="Search strategy: 'target' (proof-frontier for target score, default), "
+             "'margin' (all moves within margin-cp), "
              "'exact' (strict best values along principal variation), "
              "'and_or' (attacker=OR, defender=AND)"
     )
-    parser.add_argument("--margin-cp", type=int, default=10, help="Centipawn tolerance for near-ties (default: 10)")
+    parser.add_argument(
+        "--target-score",
+        default="auto",
+        help="Target score in cp to reach in 'target' strategy (default: 'auto' = fetches record from /atomicdb/api/roots + 1 cp, or specify integer like 1256)"
+    )
+    parser.add_argument(
+        "--margin-cp",
+        type=int,
+        default=0,
+        help="Centipawn tolerance for near-ties (default: 0 = strictly best move in target mode; 10 in margin mode)"
+    )
     parser.add_argument(
         "--defender-branching",
         type=int,
-        default=3,
-        help="Max defensive moves per AND node in and_or mode (default: 3)"
+        default=0,
+        help="Max defensive moves per AND node (default: 0 = unlimited in target mode; 3 in and_or mode)"
     )
     parser.add_argument("--max-depth", type=int, default=0, help="Max search depth in plies (0 = unlimited, default: 0)")
     parser.add_argument("--max-leaves", type=int, default=0, help="Max leaves per cycle (0 = all discovered, default: 0)")
@@ -1183,6 +1266,48 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def resolve_target_score(
+    client: AtomicDBClient,
+    root_fen: str,
+    target_arg: str,
+    min_target: Optional[int] = None
+) -> Tuple[int, str, Optional[dict]]:
+    """
+    Resolves the target score (in centipawns) for the given root position.
+    Returns (target_score, description, position_record).
+    """
+    if target_arg.lower() != "auto":
+        try:
+            target = int(target_arg)
+            if min_target is not None and target < min_target:
+                target = min_target
+            return target, f"explicitly set to {target:+d} cp", None
+        except ValueError:
+            logger.warning(f"Invalid --target-score value '{target_arg}'. Defaulting to 'auto'.")
+
+    # Auto resolution from /atomicdb/api/roots
+    rec = client.get_position_record(fen=root_fen)
+    if rec and rec.get('best_value') is not None:
+        best_val = rec['best_value']
+        target = best_val + 1
+        if min_target is not None and target < min_target:
+            target = min_target
+        return target, f"auto-fetched from /api/roots: record {best_val:+d} cp + 1 cp", rec
+
+    # Fallback to current score from /api/query
+    data = client.query(root_fen, bypass_cache=True)
+    curr_score = data.get('score') if data else None
+    if curr_score is not None and curr_score > 0:
+        target = curr_score + 1
+        if min_target is not None and target < min_target:
+            target = min_target
+        return target, f"derived from current position score: {curr_score:+d} cp + 1 cp", None
+
+    # Fallback default
+    target = min_target if min_target is not None else 1
+    return target, f"default advantage target: {target:+d} cp", None
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -1209,16 +1334,36 @@ def main():
         else "Auto (>= 1 cp if winning, unrestricted if <= 0 cp)"
     )
 
+    client = AtomicDBClient(base_url=args.server, username=args.username, password=args.password)
+
+    target_score: Optional[int] = None
+    target_desc: str = ""
+    rec_dict: Optional[dict] = None
+    if args.strategy == "target":
+        target_score, target_desc, rec_dict = resolve_target_score(
+            client=client,
+            root_fen=effective_root_fen,
+            target_arg=args.target_score
+        )
+
+    eff_margin_cp = 10 if (args.strategy == "margin" and args.margin_cp == 0) else args.margin_cp
+
     print("================================================================================")
     print("                     ATOMICDB MINIMAX QUEUE BOT                                 ")
     print("================================================================================")
     print(f" Server     : {args.server}")
-    print(f" Strategy   : {args.strategy} (margin: {args.margin_cp} cp, defender branching: {args.defender_branching})")
+    margin_display = f"margin: {eff_margin_cp} cp" if eff_margin_cp > 0 else "strict best move"
+    print(f" Strategy   : {args.strategy.upper()} ({margin_display})")
+    if args.strategy == "target" and target_score is not None:
+        print(f" Target     : {target_score:+d} cp ({target_desc})")
     print(f" Root FEN   : {effective_root_fen} ({stm_name} to move)")
     if args.moves:
         print(f" Moves      : {args.moves}")
     depth_str = "Unlimited" if args.max_depth == 0 else f"{args.max_depth} plies"
     leaves_str = "All discovered" if args.max_leaves == 0 else str(args.max_leaves)
+    branching_str = "Unlimited" if args.defender_branching == 0 else str(args.defender_branching)
+    if args.strategy in ("target", "and_or"):
+        print(f" Defender Br: {branching_str} max defensive tries per AND node")
     print(f" Max Depth  : {depth_str} | Max Leaves: {leaves_str}")
     print(f" 0 cp Filter: {'Active (skip 0 cp / draw)' if args.skip_zero_cp else 'Inactive'} | Min Score: {min_score_display}")
     print(f" Budget     : {b_label}")
@@ -1228,11 +1373,11 @@ def main():
         print(f" Account    : {args.username}")
     print("================================================================================\n")
 
-    client = AtomicDBClient(base_url=args.server, username=args.username, password=args.password)
     explorer = MinimaxFrontierExplorer(
         client=client,
         strategy=args.strategy,
-        margin_cp=args.margin_cp,
+        target_score=target_score,
+        margin_cp=eff_margin_cp,
         defender_branching=args.defender_branching,
         max_depth=args.max_depth,
         max_leaves=args.max_leaves,
@@ -1240,6 +1385,22 @@ def main():
         skip_zero_cp=args.skip_zero_cp,
         min_score=args.min_score
     )
+
+    if args.strategy == "target" and target_score is not None:
+        root_data = client.query(effective_root_fen, bypass_cache=True)
+        cur_score = root_data.get('score') if root_data else None
+        if cur_score is not None and cur_score >= target_score:
+            print("=" * 80)
+            print(f" 🏆 TARGET ALREADY ACHIEVED! Root score is {cur_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
+            print("=" * 80)
+            target_score, target_desc, _ = resolve_target_score(
+                client=client,
+                root_fen=effective_root_fen,
+                target_arg=args.target_score,
+                min_target=cur_score + 1
+            )
+            explorer.target_score = target_score
+            logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
 
     try:
         if args.mode == "once":
@@ -1256,6 +1417,22 @@ def main():
             logger.info("Starting reactive monitoring loop...")
             while True:
                 try:
+                    if explorer.strategy == "target" and target_score is not None:
+                        root_data = client.query(effective_root_fen, bypass_cache=True)
+                        cur_score = root_data.get('score') if root_data else None
+                        if cur_score is not None and cur_score >= target_score:
+                            print("\n" + "=" * 80)
+                            print(f" 🏆 TARGET ACHIEVED! Root score reached {cur_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
+                            print("=" * 80 + "\n")
+                            target_score, target_desc, _ = resolve_target_score(
+                                client=client,
+                                root_fen=effective_root_fen,
+                                target_arg=args.target_score,
+                                min_target=cur_score + 1
+                            )
+                            explorer.target_score = target_score
+                            logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
+
                     tracked_tasks = run_cycle(
                         client=client,
                         explorer=explorer,
