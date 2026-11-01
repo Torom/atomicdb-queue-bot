@@ -523,6 +523,11 @@ class MinimaxFrontierExplorer:
                 effective_min_score=effective_min_score
             )
 
+            if not selected_moves:
+                if self.strategy == "target" and stm != root_stm:
+                    logger.debug(f"Branch secured at depth {depth}: all defender responses meet target score.")
+                continue
+
             # Execute selected follow-up moves on the board
             try:
                 board = chess.variant.AtomicBoard(fen)
