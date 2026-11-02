@@ -496,6 +496,17 @@ class MinimaxFrontierExplorer:
                 if effective_min_score is not None and stm == root_stm and node_score is not None and node_score < effective_min_score:
                     continue
 
+                # In target strategy, evaluate the leaf strictly against the target score:
+                if self.strategy == "target" and self.target_score is not None and node_score is not None:
+                    # Bottleneck search: We only queue leaves that prevent us from achieving target!
+                    # If the leaf score already suffices for target (White >= target), do not queue!
+                    # 1. Attacker (stm == root_stm): White score is node_score
+                    if stm == root_stm and node_score >= self.target_score:
+                        continue
+                    # 2. Defender (stm != root_stm): White score is -node_score (White >= target iff node_score <= -target)
+                    if stm != root_stm and node_score <= -self.target_score:
+                        continue
+
                 if fen not in seen_leaves:
                     seen_leaves.add(fen)
                     leaf = LeafCandidate(
@@ -680,6 +691,17 @@ class MinimaxFrontierExplorer:
 
                 if move_visits == 0 and child_fen not in self.known_analyzed_fens:
                     # Child has never been analyzed -> leaf node!
+                    # In target strategy, evaluate the leaf strictly against the target score:
+                    if self.strategy == "target" and self.target_score is not None and move_score is not None:
+                        # Bottleneck search: We only queue leaves that prevent us from achieving target!
+                        # If the leaf score already suffices for target (White >= target), do not queue!
+                        # 1. Attacker (stm == root_stm) made the move to this leaf: White score is move_score
+                        if stm == root_stm and move_score >= self.target_score:
+                            continue
+                        # 2. Defender (stm != root_stm) made the move to this leaf: White score is -move_score
+                        if stm != root_stm and move_score <= -self.target_score:
+                            continue
+
                     if child_fen not in seen_leaves:
                         seen_leaves.add(child_fen)
                         reason_str = 'cycle_exit' if m.get('_is_cycle_exit') else 'child_zero_visits'
@@ -816,32 +838,37 @@ class MinimaxFrontierExplorer:
             best_score = min(best_score, node_score)
 
         if self.strategy == "target":
-            # Proof-frontier search for target score:
-            # Attacker (root_stm): Follow the best move (max score) that establishes the record.
-            # Defender (!= root_stm): Follow only SCORED moves where the opponent holds White below target
-            # (m['score'] > -target). Unopened/unsearched moves at intermediate plies are ignored because
-            # engine search already pruned them and the DB does not require them for backpropagation.
             target = self.target_score if self.target_score is not None else 1
+            margin_tol = self.margin_cp if self.margin_cp > 0 else 0
+
             if stm == root_stm:
-                margin_tol = self.margin_cp if self.margin_cp > 0 else 0
-                selected = [
+                # Attacker (White / OR node): White chooses its attack freely and strictly plays its
+                # single best move (max score). White never branches into inferior moves.
+                best_candidates = [
                     m for m in scored_moves
-                    if m['score'] >= best_score - margin_tol and m.get('status') == 'UNKNOWN'
+                    if m['score'] == best_score and m.get('status') == 'UNKNOWN'
                 ]
-                if not selected and best_move:
-                    selected = [m for m in scored_moves if m['uci'] == best_move]
+                if not best_candidates and best_move:
+                    best_candidates = [m for m in scored_moves if m['uci'] == best_move]
+                if len(best_candidates) > 1 and best_move:
+                    bm_filtered = [m for m in best_candidates if m['uci'] == best_move]
+                    selected = bm_filtered if bm_filtered else best_candidates[:1]
+                else:
+                    selected = best_candidates[:1]
             else:
+                # Defender (Black / AND node):
+                # Follow candidate defenses that hold White below target (m['score'] > -target - margin_tol).
+                # Moves with m['score'] <= -target - margin_tol are pruned as secured for White.
                 candidates = [
                     m for m in scored_moves
-                    if m.get('status') == 'UNKNOWN' and m['score'] > -target
+                    if m.get('status') == 'UNKNOWN' and m['score'] > -target - margin_tol
                 ]
                 if not candidates:
                     return []
 
                 candidates.sort(key=lambda m: m['score'], reverse=True)
-                if self.defender_branching > 0:
-                    candidates = candidates[:self.defender_branching]
-                selected = candidates
+                def_branch = self.defender_branching if self.defender_branching > 0 else len(candidates)
+                selected = candidates[:def_branch]
         elif self.strategy == "exact":
             # Strict best score
             selected = [
@@ -1216,7 +1243,7 @@ def parse_arguments():
         "--defender-branching",
         type=int,
         default=0,
-        help="Max defensive moves per AND node (default: 0 = unlimited in target mode; 3 in and_or mode)"
+        help="Max candidate moves for the opponent/defender to explore at each node (default: 0 = unlimited; 3 in and_or mode)"
     )
     parser.add_argument("--max-depth", type=int, default=0, help="Max search depth in plies (0 = unlimited, default: 0)")
     parser.add_argument("--max-leaves", type=int, default=0, help="Max leaves per cycle (0 = all discovered, default: 0)")
@@ -1352,6 +1379,7 @@ def main():
         )
 
     eff_margin_cp = 10 if (args.strategy == "margin" and args.margin_cp == 0) else args.margin_cp
+    eff_defender_branching = 3 if (args.strategy == "and_or" and args.defender_branching == 0) else args.defender_branching
 
     print("================================================================================")
     print("                     ATOMICDB MINIMAX QUEUE BOT                                 ")
@@ -1366,7 +1394,7 @@ def main():
         print(f" Moves      : {args.moves}")
     depth_str = "Unlimited" if args.max_depth == 0 else f"{args.max_depth} plies"
     leaves_str = "All discovered" if args.max_leaves == 0 else str(args.max_leaves)
-    branching_str = "Unlimited" if args.defender_branching == 0 else str(args.defender_branching)
+    branching_str = "Unlimited" if eff_defender_branching == 0 else str(eff_defender_branching)
     if args.strategy in ("target", "and_or"):
         print(f" Defender Br: {branching_str} max defensive tries per AND node")
     print(f" Max Depth  : {depth_str} | Max Leaves: {leaves_str}")
@@ -1383,7 +1411,7 @@ def main():
         strategy=args.strategy,
         target_score=target_score,
         margin_cp=eff_margin_cp,
-        defender_branching=args.defender_branching,
+        defender_branching=eff_defender_branching,
         max_depth=args.max_depth,
         max_leaves=args.max_leaves,
         max_queries=args.max_queries,
