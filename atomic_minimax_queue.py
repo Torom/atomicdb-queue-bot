@@ -473,16 +473,6 @@ class MinimaxFrontierExplorer:
             best_move = data.get('best_move')
             node_score = data.get('score')
 
-            # Own engine analysis lines for this position (used to detect borrowed move values)
-            analysis = data.get('analysis') or {}
-            own_line_evals = {}
-            for line in analysis.get('lines', []):
-                if isinstance(line, dict):
-                    line_move = line.get('move')
-                    line_cp = line.get('cp')
-                    if line_move and line_cp is not None:
-                        own_line_evals.setdefault(line_move, set()).add(line_cp)
-
             if not min_score_initialized and depth == 0:
                 min_score_initialized = True
                 if node_score is not None and node_score > 0:
@@ -689,16 +679,8 @@ class MinimaxFrontierExplorer:
                 new_path_fens = path_fens | {child_fen}
                 new_depth = depth + 1
 
-                # A move's value is borrowed if it has never been searched directly (0 visits),
-                # has no backpropagated plies, this node has its own engine analysis, and the
-                # move score differs from all scores this node's own analysis reported for it:
-                is_borrowed = (
-                    move_score is not None
-                    and move_visits == 0
-                    and move_backed == 0
-                    and bool(own_line_evals)
-                    and move_score not in own_line_evals.get(uci, set())
-                )
+                # Use the 'borrowed' flag directly from the API (added in server PR #133):
+                is_borrowed = bool(m.get('borrowed', False))
 
                 # 0 cp and min-score check for follow-up moves
                 child_is_pv = is_pv and (best_move is not None and uci == best_move)
