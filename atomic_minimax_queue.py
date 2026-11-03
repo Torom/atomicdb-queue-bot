@@ -410,9 +410,9 @@ class MinimaxFrontierExplorer:
         effective_min_score: Optional[int] = self.min_score
         min_score_initialized = (self.min_score is not None)
 
-        # Priority Queue for open search nodes: (priority, depth, path, path_fens, fen)
+        # Priority Queue for open search nodes: (priority, depth, path, path_fens, fen, is_pv)
         frontier = []
-        heappush(frontier, (0.0, 0, [], {root_fen}, root_fen))
+        heappush(frontier, (0.0, 0, [], {root_fen}, root_fen, True))
         visited_nodes: Set[str] = set()
 
         last_logged_query = 0
@@ -434,7 +434,7 @@ class MinimaxFrontierExplorer:
                     f"Open nodes: {len(frontier)}"
                 )
 
-            priority, depth, path, path_fens, fen = heappop(frontier)
+            priority, depth, path, path_fens, fen, is_pv = heappop(frontier)
 
             if self.max_depth > 0 and depth > self.max_depth:
                 continue
@@ -473,6 +473,16 @@ class MinimaxFrontierExplorer:
             best_move = data.get('best_move')
             node_score = data.get('score')
 
+            # Own engine analysis lines for this position (used to detect borrowed move values)
+            analysis = data.get('analysis') or {}
+            own_line_evals = {}
+            for line in analysis.get('lines', []):
+                if isinstance(line, dict):
+                    line_move = line.get('move')
+                    line_cp = line.get('cp')
+                    if line_move and line_cp is not None:
+                        own_line_evals.setdefault(line_move, set()).add(line_cp)
+
             if not min_score_initialized and depth == 0:
                 min_score_initialized = True
                 if node_score is not None and node_score > 0:
@@ -481,13 +491,15 @@ class MinimaxFrontierExplorer:
                     effective_min_score = None
 
             # 0 cp / loss check for existing nodes:
-            if self.skip_zero_cp and node_score is not None and node_score == 0:
-                if depth == 0:
-                    logger.info("Root position has score 0 cp. With --skip-zero-cp, no tree will be explored.")
+            if depth == 0 and self.skip_zero_cp and node_score is not None and node_score == 0:
+                logger.info("Root position has score 0 cp. With --skip-zero-cp, no tree will be explored.")
                 continue
 
-            if effective_min_score is not None and node_score is not None and stm == root_stm and node_score < effective_min_score:
-                continue
+            if not is_pv:
+                if self.skip_zero_cp and node_score is not None and node_score == 0:
+                    continue
+                if effective_min_score is not None and node_score is not None and stm == root_stm and node_score < effective_min_score:
+                    continue
 
             if visits == 0:
                 # Position exists in DB but has 0 visits -> leaf node!
@@ -498,14 +510,16 @@ class MinimaxFrontierExplorer:
 
                 # In target strategy, evaluate the leaf strictly against the target score:
                 if self.strategy == "target" and self.target_score is not None and node_score is not None:
-                    # Bottleneck search: We only queue leaves that prevent us from achieving target!
-                    # If the leaf score already suffices for target (White >= target), do not queue!
-                    # 1. Attacker (stm == root_stm): White score is node_score
-                    if stm == root_stm and node_score >= self.target_score:
-                        continue
-                    # 2. Defender (stm != root_stm): White score is -node_score (White >= target iff node_score <= -target)
-                    if stm != root_stm and node_score <= -self.target_score:
-                        continue
+                    # If this is the root FEN itself (depth == 0) and has 0 visits, always queue it!
+                    if depth > 0:
+                        # Bottleneck search: We only queue leaves that prevent us from achieving target!
+                        # If the leaf score already suffices for target (White >= target), do not queue!
+                        # 1. Attacker (stm == root_stm): White score is node_score
+                        if stm == root_stm and node_score >= self.target_score:
+                            continue
+                        # 2. Defender (stm != root_stm): White score is -node_score (White >= target iff node_score <= -target)
+                        if stm != root_stm and node_score <= -self.target_score:
+                            continue
 
                 if fen not in seen_leaves:
                     seen_leaves.add(fen)
@@ -531,7 +545,8 @@ class MinimaxFrontierExplorer:
                 stm, moves, best_move,
                 root_stm=root_stm,
                 node_score=node_score,
-                effective_min_score=effective_min_score
+                effective_min_score=effective_min_score,
+                is_pv=is_pv
             )
 
             if not selected_moves:
@@ -669,42 +684,66 @@ class MinimaxFrontierExplorer:
                 if cached_child is not None and cached_child.get('visits', 0) > 0:
                     move_visits = cached_child.get('visits', 0)
                 move_score = m.get('score')
+                move_backed = m.get('backed_plies', 0)
                 new_path = path + [uci]
                 new_path_fens = path_fens | {child_fen}
                 new_depth = depth + 1
 
+                # A move's value is borrowed if it has never been searched directly (0 visits),
+                # has no backpropagated plies, this node has its own engine analysis, and the
+                # move score differs from all scores this node's own analysis reported for it:
+                is_borrowed = (
+                    move_score is not None
+                    and move_visits == 0
+                    and move_backed == 0
+                    and bool(own_line_evals)
+                    and move_score not in own_line_evals.get(uci, set())
+                )
+
                 # 0 cp and min-score check for follow-up moves
-                if self.skip_zero_cp and move_score is not None and move_score == 0:
-                    continue
-                if effective_min_score is not None and stm == root_stm and move_score is not None and move_score < effective_min_score:
-                    continue
+                child_is_pv = is_pv and (best_move is not None and uci == best_move)
+                if not child_is_pv:
+                    if self.skip_zero_cp and move_score is not None and move_score == 0:
+                        continue
+                    if effective_min_score is not None and stm == root_stm and move_score is not None and move_score < effective_min_score:
+                        continue
 
                 # Branch priority calculation (Best-First / depth-first along PV):
                 # 1. Deeper nodes first (factor -new_depth * 1000.0) -> advances to PV head immediately
                 # 2. Prefer engine's official best move (best_move)
-                # 3. Prefer moves with higher visit count
-                # 4. Prefer higher minimax scores
+                # 3. Prefer PV line (-10000.0 bonus)
+                # 4. Prefer moves with higher visit count
+                # 5. Prefer higher minimax scores
                 bm_bonus = -200.0 if (best_move and uci == best_move) else 0.0
+                pv_bonus = -10000.0 if child_is_pv else 0.0
                 visit_bonus = -min(move_visits, 50) * 2.0
                 score_bonus = -move_score / 10.0 if move_score is not None else 0.0
-                child_priority = (-new_depth * 1000.0) + bm_bonus + visit_bonus + score_bonus
+                child_priority = (-new_depth * 1000.0) + bm_bonus + pv_bonus + visit_bonus + score_bonus
 
                 if move_visits == 0 and child_fen not in self.known_analyzed_fens:
                     # Child has never been analyzed -> leaf node!
                     # In target strategy, evaluate the leaf strictly against the target score:
                     if self.strategy == "target" and self.target_score is not None and move_score is not None:
-                        # Bottleneck search: We only queue leaves that prevent us from achieving target!
-                        # If the leaf score already suffices for target (White >= target), do not queue!
-                        # 1. Attacker (stm == root_stm) made the move to this leaf: White score is move_score
-                        if stm == root_stm and move_score >= self.target_score:
-                            continue
-                        # 2. Defender (stm != root_stm) made the move to this leaf: White score is -move_score
-                        if stm != root_stm and move_score <= -self.target_score:
-                            continue
+                        # If the value is borrowed (not verified by engine search on this position),
+                        # do not prune it as already meeting the target score!
+                        if not is_borrowed:
+                            # Bottleneck search: We only queue leaves that prevent us from achieving target!
+                            # If the leaf score already suffices for target (White >= target), do not queue!
+                            # 1. Attacker (stm == root_stm) made the move to this leaf: White score is move_score
+                            if stm == root_stm and move_score >= self.target_score:
+                                continue
+                            # 2. Defender (stm != root_stm) made the move to this leaf: White score is -move_score
+                            if stm != root_stm and move_score <= -self.target_score:
+                                continue
 
                     if child_fen not in seen_leaves:
                         seen_leaves.add(child_fen)
-                        reason_str = 'cycle_exit' if m.get('_is_cycle_exit') else 'child_zero_visits'
+                        if is_borrowed:
+                            reason_str = 'borrowed_top_move' if (best_move and uci == best_move) else 'borrowed_value'
+                        elif m.get('_is_cycle_exit'):
+                            reason_str = 'cycle_exit'
+                        else:
+                            reason_str = 'child_zero_visits'
                         leaf = LeafCandidate(
                             fen=child_fen,
                             path=new_path,
@@ -718,7 +757,7 @@ class MinimaxFrontierExplorer:
                         if on_leaf:
                             on_leaf(leaf)
                 else:
-                    heappush(frontier, (child_priority, new_depth, new_path, new_path_fens, child_fen))
+                    heappush(frontier, (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv))
 
         # Cycle Trap Recovery (Cycle-Exit Recovery):
         # If minimax search found no open leaves because all active branches
@@ -811,7 +850,8 @@ class MinimaxFrontierExplorer:
         best_move: Optional[str],
         root_stm: str = 'w',
         node_score: Optional[int] = None,
-        effective_min_score: Optional[int] = None
+        effective_min_score: Optional[int] = None,
+        is_pv: bool = False
     ) -> List[dict]:
         """Selects moves relevant for minimax/solving based on strategy."""
         scored_moves = [
@@ -820,14 +860,14 @@ class MinimaxFrontierExplorer:
         ]
 
         if self.skip_zero_cp:
-            # Filter out 0 cp moves (draw)
-            scored_moves = [m for m in scored_moves if m['score'] != 0]
+            # Filter out 0 cp moves (draw), preserving best_move if on PV
+            scored_moves = [m for m in scored_moves if m['score'] != 0 or (is_pv and best_move and m['uci'] == best_move)]
             # For root player (attacker), filter out moves below effective_min_score if active
             if stm == root_stm and effective_min_score is not None:
-                scored_moves = [m for m in scored_moves if m['score'] >= effective_min_score]
+                scored_moves = [m for m in scored_moves if m['score'] >= effective_min_score or (is_pv and best_move and m['uci'] == best_move)]
 
         if not scored_moves:
-            if not self.skip_zero_cp and best_move:
+            if best_move:
                 return [m for m in moves if m['uci'] == best_move]
             return []
 
@@ -844,17 +884,24 @@ class MinimaxFrontierExplorer:
             if stm == root_stm:
                 # Attacker (White / OR node): White chooses its attack freely and strictly plays its
                 # single best move (max score). White never branches into inferior moves.
-                best_candidates = [
-                    m for m in scored_moves
-                    if m['score'] == best_score and m.get('status') == 'UNKNOWN'
-                ]
-                if not best_candidates and best_move:
-                    best_candidates = [m for m in scored_moves if m['uci'] == best_move]
-                if len(best_candidates) > 1 and best_move:
-                    bm_filtered = [m for m in best_candidates if m['uci'] == best_move]
-                    selected = bm_filtered if bm_filtered else best_candidates[:1]
+                # PV GUARANTEE: If on the PV, strictly follow best_move to stay on the main line.
+                if is_pv and best_move:
+                    bm_m = next((m for m in scored_moves if m['uci'] == best_move and m.get('status') == 'UNKNOWN'), None)
+                    if not bm_m:
+                        bm_m = next((m for m in moves if m['uci'] == best_move), None)
+                    selected = [bm_m] if bm_m else []
                 else:
-                    selected = best_candidates[:1]
+                    best_candidates = [
+                        m for m in scored_moves
+                        if m['score'] == best_score and m.get('status') == 'UNKNOWN'
+                    ]
+                    if not best_candidates and best_move:
+                        best_candidates = [m for m in scored_moves if m['uci'] == best_move]
+                    if len(best_candidates) > 1 and best_move:
+                        bm_filtered = [m for m in best_candidates if m['uci'] == best_move]
+                        selected = bm_filtered if bm_filtered else best_candidates[:1]
+                    else:
+                        selected = best_candidates[:1]
             else:
                 # Defender (Black / AND node):
                 # Follow candidate defenses that hold White below target (m['score'] > -target - margin_tol).
@@ -863,12 +910,24 @@ class MinimaxFrontierExplorer:
                     m for m in scored_moves
                     if m.get('status') == 'UNKNOWN' and m['score'] > -target - margin_tol
                 ]
+                # PV GUARANTEE: If this node is on the PV, Black's best_move is ALWAYS followed,
+                # even if its score in the DB is <= -target due to server backprop lag!
+                bm_m = None
+                if is_pv and best_move:
+                    bm_m = next((m for m in scored_moves if m['uci'] == best_move and m.get('status') == 'UNKNOWN'), None)
+                    if not bm_m:
+                        bm_m = next((m for m in moves if m['uci'] == best_move), None)
+                    if bm_m and bm_m not in candidates:
+                        candidates.append(bm_m)
+
                 if not candidates:
                     return []
 
                 candidates.sort(key=lambda m: m['score'], reverse=True)
                 def_branch = self.defender_branching if self.defender_branching > 0 else len(candidates)
                 selected = candidates[:def_branch]
+                if is_pv and bm_m and bm_m not in selected:
+                    selected.append(bm_m)
         elif self.strategy == "exact":
             # Strict best score
             selected = [
@@ -1078,6 +1137,35 @@ def run_cycle(
     print("=" * 78)
     if not leaves:
         logger.info("No open leaf nodes found (tree is solved or saturated at frontier).")
+        if explorer.strategy == "target" and explorer.target_score is not None:
+            orig_target = explorer.target_score
+            orig_branching = explorer.defender_branching
+            breaker_target = orig_target + 1
+            breaker_branching = 2
+            logger.info(
+                f"[BREAKER] Saturated at {orig_target:+d} cp. "
+                f"Trying {breaker_target:+d} cp (def-branch: {breaker_branching})..."
+            )
+            try:
+                explorer.target_score = breaker_target
+                explorer.defender_branching = breaker_branching
+                client.query_count = 0
+                breaker_leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
+                print("=" * 78)
+                if not breaker_leaves:
+                    logger.info("[BREAKER] No open leaf nodes found in breaker pass either.")
+                else:
+                    extra_info = [f"{queued_count} queued"]
+                    if already_analyzed_count > 0:
+                        extra_info.append(f"{already_analyzed_count} already analyzed")
+                    summary_str = ", ".join(extra_info)
+                    logger.info(
+                        f"[BREAKER] Traversal complete: {len(breaker_leaves)} leaves found, "
+                        f"{summary_str} ({client.query_count} queries)."
+                    )
+            finally:
+                explorer.target_score = orig_target
+                explorer.defender_branching = orig_branching
     else:
         extra_info = [f"{queued_count} queued"]
         if already_analyzed_count > 0:
@@ -1313,27 +1401,38 @@ def resolve_target_score(
             target = int(target_arg)
             if min_target is not None and target < min_target:
                 target = min_target
+                return target, f"advanced beyond root score: {target:+d} cp", None
             return target, f"explicitly set to {target:+d} cp", None
         except ValueError:
             logger.warning(f"Invalid --target-score value '{target_arg}'. Defaulting to 'auto'.")
 
-    # Auto resolution from /atomicdb/api/roots
+    # Auto resolution from /atomicdb/api/roots combined with live root score
     rec = client.get_position_record(fen=root_fen)
-    if rec and rec.get('best_value') is not None:
-        best_val = rec['best_value']
-        target = best_val + 1
-        if min_target is not None and target < min_target:
-            target = min_target
-        return target, f"auto-fetched from /api/roots: record {best_val:+d} cp + 1 cp", rec
+    best_rec_val = rec.get('best_value') if rec else None
 
-    # Fallback to current score from /api/query
+    # Fetch live score to ensure target doesn't lag behind asynchronous record updates
     data = client.query(root_fen, bypass_cache=True)
     curr_score = data.get('score') if data else None
-    if curr_score is not None and curr_score > 0:
-        target = curr_score + 1
+
+    if best_rec_val is not None or curr_score is not None:
+        if best_rec_val is not None and curr_score is not None:
+            effective_record = max(best_rec_val, curr_score)
+            source = "record"
+        elif best_rec_val is not None:
+            effective_record = best_rec_val
+            source = "record"
+        else:
+            effective_record = curr_score
+            source = "current score"
+
+        target = effective_record + 1
         if min_target is not None and target < min_target:
             target = min_target
-        return target, f"derived from current position score: {curr_score:+d} cp + 1 cp", None
+
+        if effective_record is not None and target == effective_record + 1:
+            return target, f"auto-fetched from /api/roots: {source} {effective_record:+d} cp + 1 cp", rec
+        else:
+            return target, f"auto-advanced beyond current root score: {target:+d} cp", rec
 
     # Fallback default
     target = min_target if min_target is not None else 1
