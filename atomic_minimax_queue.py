@@ -1165,12 +1165,14 @@ def run_cycle(
 def wait_for_completion(
     client: AtomicDBClient,
     tracked_tasks: List[dict],
-    poll_interval: int = 5,
+    poll_interval: int = 1,
     max_wait: int = 600
 ) -> bool:
     """
-    Dynamically waits for submitted tasks to finish analysis.
-    Returns immediately once all tasks are completed in the tree with visits > 0.
+    Dynamically waits for submitted tasks to reach the next cycle condition.
+    Returns immediately once:
+    1. None of our requested tasks are waiting to be computed (all are LEASED/searching or completed).
+    2. At least one task has completed (active queue length decreased by at least 1).
 
     Efficiency & Rate-Limiting:
     - For logged-in user: Polls the central 'my-queue' endpoint directly (1 request per poll),
@@ -1182,16 +1184,23 @@ def wait_for_completion(
         return True
 
     start_time = time.time()
-    active_tasks = {t['key']: t for t in tracked_tasks if t.get('key')}
-    initial_count = len(active_tasks)
+    active_tasks = {t.get('key') or key_of(t.get('fen', '')): t for t in tracked_tasks}
+    initial_count = len(tracked_tasks)
+
+    tracked_keys = {t['key'] for t in tracked_tasks if t.get('key')}
+    tracked_task_ids = {t['task_id'] for t in tracked_tasks if t.get('task_id') is not None}
+    tracked_fens = {canonicalize_fen(t['fen']) for t in tracked_tasks if t.get('fen')}
 
     logger.info(
         f"Waiting for {initial_count} task(s) "
         f"(polling every {poll_interval}s, max wait: {max_wait if max_wait > 0 else '∞'}s)..."
     )
 
+    seen_active_ids: Set[int] = set()
+    completed_ids: Set[int] = set()
     last_status_msg = ""
-    while active_tasks:
+
+    while True:
         elapsed = int(time.time() - start_time)
         if max_wait > 0 and elapsed >= max_wait:
             logger.info(f"Max wait interval ({max_wait}s) reached. Starting next cycle...")
@@ -1206,27 +1215,101 @@ def wait_for_completion(
                 time.sleep(poll_interval)
                 continue
 
-            if len(user_queue) > 0:
-                leased = sum(1 for t in user_queue if t.get('state') == 'LEASED')
-                pending = sum(1 for t in user_queue if t.get('state') == 'PENDING')
-                count_str = f"{len(user_queue)}+" if len(user_queue) >= 200 else str(len(user_queue))
-                first_tid = user_queue[0].get('task_id')
-                extra = f" | Task #{first_tid}" if first_tid else ""
-
-                msg = f"[Waiting] {count_str} in my-queue ({leased} searching, {pending} queued{extra}) · {elapsed}s"
-                if len(msg) > 98:
-                    msg = msg[:95] + "..."
-                if msg != last_status_msg:
-                    logger.info(msg)
-                    last_status_msg = msg
-
-                time.sleep(poll_interval)
-                continue
-
             # my-queue was successfully queried and is empty ([]):
             # All account tasks have finished!
-            active_tasks.clear()
-            break
+            if not user_queue:
+                logger.info(f"All submitted tasks completed ({elapsed}s)")
+                return True
+
+            leased = sum(1 for t in user_queue if t.get('state') == 'LEASED')
+            pending = sum(1 for t in user_queue if t.get('state') == 'PENDING')
+            count_str = f"{len(user_queue)}+" if len(user_queue) >= 200 else str(len(user_queue))
+            first_tid = user_queue[0].get('task_id')
+            extra = f" | Task #{first_tid}" if first_tid else ""
+
+            # Match tasks in user_queue against tracked tasks from this batch:
+            our_in_queue = []
+            for item in user_queue:
+                tid = item.get('task_id')
+                if tid is not None and tid in tracked_task_ids:
+                    our_in_queue.append(item)
+                    seen_active_ids.add(tid)
+                    continue
+                pos = item.get('position')
+                if pos is not None:
+                    if pos in tracked_keys or pos in tracked_fens:
+                        our_in_queue.append(item)
+                        if tid is not None:
+                            seen_active_ids.add(tid)
+                        continue
+                    try:
+                        pos_canon = canonicalize_fen(pos)
+                        if pos_canon in tracked_fens or key_of(pos_canon) in tracked_keys:
+                            our_in_queue.append(item)
+                            if tid is not None:
+                                seen_active_ids.add(tid)
+                            continue
+                    except Exception:
+                        pass
+
+            # Detect finished tasks among tasks that WERE in the queue window:
+            current_tids = {item.get('task_id') for item in user_queue if item.get('task_id') is not None}
+            completed_ids.update(seen_active_ids - current_tids)
+
+            our_pending = sum(1 for t in our_in_queue if t.get('state') == 'PENDING')
+            our_leased = sum(1 for t in our_in_queue if t.get('state') == 'LEASED')
+
+            is_queue_capped = (len(user_queue) >= 200)
+
+            # Special case for 200+ capped queue:
+            # If the queue has 200+ tasks, any tracked task that hasn't even appeared
+            # in the 200-task window yet is queued beyond position 200 (still waiting).
+            # We don't need any extra API calls: unseen tasks are simply pending in line.
+            if is_queue_capped:
+                seen_task_keys_or_fens = {
+                    item.get('position') for item in our_in_queue if item.get('position')
+                }
+                for t in tracked_tasks:
+                    t_id = t.get('task_id')
+                    t_key = t.get('key')
+                    if (t_id is not None and (t_id in completed_ids or t_id in current_tids)) or \
+                       (t_key is not None and t_key in seen_task_keys_or_fens):
+                        continue
+                    # Never seen in the 200 window and not completed -> waiting at position 201+!
+                    our_pending += 1
+
+                finished_count = len(completed_ids)
+                at_least_one_done = (finished_count >= 1)
+            else:
+                # Normal case (< 200 tasks in queue): All tasks in account queue are visible.
+                finished_count = max(len(completed_ids), initial_count - len(our_in_queue))
+                at_least_one_done = (finished_count >= 1) or (len(user_queue) <= initial_count - 1)
+
+            # Condition to start next cycle early:
+            # 1. No requested task is waiting to be computed (all are LEASED/searching or finished)
+            # 2. At least one task has completed (finished_count >= 1 or user_queue <= initial_count - 1)
+            none_waiting = (our_pending == 0)
+
+            if none_waiting and at_least_one_done:
+                if finished_count >= initial_count:
+                    logger.info(f"All submitted tasks completed ({elapsed}s)")
+                else:
+                    active_searching = max(0, initial_count - finished_count)
+                    logger.info(
+                        f"Cycle trigger: {active_searching} searching, 0 waiting, "
+                        f"{finished_count}/{initial_count} completed ({elapsed}s)"
+                    )
+                return True
+
+            msg = f"[Waiting] {count_str} in my-queue ({leased} searching, {pending} queued{extra}) · {elapsed}s"
+            if len(msg) > 98:
+                msg = msg[:95] + "..."
+            if msg != last_status_msg:
+                logger.info(msg)
+                last_status_msg = msg
+
+            time.sleep(poll_interval)
+            continue
 
         # --- PATH 2: External or anonymous tasks (throttled!) ---
         # Check at most 5 tasks per poll step, with 0.25s pause (max 4 req/s)
@@ -1253,11 +1336,22 @@ def wait_for_completion(
             if k in active_tasks:
                 del active_tasks[k]
 
+        finished_count = initial_count - len(active_tasks)
         if not active_tasks:
-            break
+            logger.info(f"All submitted tasks completed ({elapsed}s)")
+            return True
 
         running_count = len(active_tasks)
         pending_count = max(0, running_count - leased_count)
+
+        if pending_count == 0 and finished_count >= 1:
+            active_searching = max(0, initial_count - finished_count)
+            logger.info(
+                f"Cycle trigger: {active_searching} searching, 0 waiting, "
+                f"{finished_count}/{initial_count} completed ({elapsed}s)"
+            )
+            return True
+
         state_parts = []
         if leased_count > 0:
             state_parts.append(f"{leased_count} searching")
@@ -1273,9 +1367,6 @@ def wait_for_completion(
             last_status_msg = msg
 
         time.sleep(poll_interval)
-
-    logger.info(f"All submitted tasks completed (Duration: {int(time.time() - start_time)}s)!")
-    return True
 
 
 def parse_arguments():
@@ -1350,8 +1441,8 @@ def parse_arguments():
     parser.add_argument(
         "--poll-interval",
         type=int,
-        default=5,
-        help="Interval in seconds for polling task completion (default: 5s)"
+        default=1,
+        help="Interval in seconds for polling task completion (default: 1s)"
     )
     parser.add_argument(
         "--max-wait",
@@ -1592,7 +1683,6 @@ def main():
                         poll_interval=args.poll_interval,
                         max_wait=args.max_wait
                     )
-                    logger.info("Starting next minimax cycle immediately...")
 
                 except KeyboardInterrupt:
                     logger.info("Terminated by user.")

@@ -166,7 +166,7 @@ You can anchor the search at any line or defense variation:
 | `--min-score` | `Auto` | Minimum score for root player moves (`>= 1 cp` if winning, unrestricted if `<= 0 cp`) |
 | `--budget` | `128000000` | Node budget for analysis tasks (default: 128M) |
 | `--mode` | `once` | Operating mode: `once` (single run) or `loop` (reactive daemon) |
-| `--poll-interval` | `5` | Polling interval in seconds to check task progress in loop mode |
+| `--poll-interval` | `1` | Polling interval in seconds to check task progress in loop mode |
 | `--max-wait` | `600` | Max wait time in seconds for active tasks before forcing a new cycle (`0` = unlimited) |
 | `--idle-interval` | `30` | Idle wait time in seconds if no tasks are active |
 | `--server` | `https://belzedar.duckdns.org/atomicdb` | AtomicDB base URL |
