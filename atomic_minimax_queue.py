@@ -158,10 +158,10 @@ class AtomicDBClient:
         """Closes the underlying requests session."""
         self.session.close()
 
-    def _rate_limit(self, min_interval: float = 0.21):
+    def _rate_limit(self, min_interval: float = 0.1):
         """
-        Enforces a minimum interval between requests (default: 0.21s = ~4.76 req/s)
-        to stay safely within Nginx's rate limit of 5 req/s regardless of network RTT.
+        Enforces a minimum interval between requests (default: 0.1s = 10 req/s)
+        to stay safely within Nginx's rate limit of 10 req/s regardless of network RTT.
         """
         now = time.perf_counter()
         elapsed = now - self.last_request_time
@@ -183,7 +183,7 @@ class AtomicDBClient:
 
         retries = 3
         while retries > 0:
-            self._rate_limit(0.21)
+            self._rate_limit()
             try:
                 resp = self.session.get(url, params={'fen': fen}, timeout=15)
                 if resp.status_code == 200:
@@ -228,7 +228,7 @@ class AtomicDBClient:
         if budget is not None:
             post_data['budget'] = str(budget)
 
-        self._rate_limit(0.21)
+        self._rate_limit()
         url = f"{self.base_url}/api/request"
         try:
             resp = self.session.post(url, data=post_data, timeout=15)
@@ -251,7 +251,7 @@ class AtomicDBClient:
             'username': self.username,
             'password': self.password
         }
-        self._rate_limit(0.21)
+        self._rate_limit()
         url = f"{self.base_url}/api/my-queue/"
         try:
             resp = self.session.post(url, data=post_data, timeout=15)
@@ -282,7 +282,7 @@ class AtomicDBClient:
         Queries the live status of a task (GET /atomicdb/api/live-request/<key>/).
         Returns e.g. {'live': True, 'text': ..., 'chip': ...} or {'live': False}.
         """
-        self._rate_limit(0.21)
+        self._rate_limit()
         url = f"{self.base_url}/api/live-request/{key}/"
         try:
             resp = self.session.get(url, timeout=10)
@@ -307,7 +307,7 @@ class AtomicDBClient:
             'username': self.username,
             'password': self.password
         }
-        self._rate_limit(0.21)
+        self._rate_limit()
         url = f"{self.base_url}/api/queue-cancel/{task_id}/"
         try:
             resp = self.session.post(url, data=post_data, timeout=15)
@@ -320,7 +320,7 @@ class AtomicDBClient:
         Retrieves root and opening record extremes (GET /atomicdb/api/roots).
         Returns the parsed JSON response or None on error.
         """
-        self._rate_limit(0.21)
+        self._rate_limit()
         url = f"{self.base_url}/api/roots"
         try:
             resp = self.session.get(url, timeout=15)
@@ -1177,8 +1177,8 @@ def wait_for_completion(
     Efficiency & Rate-Limiting:
     - For logged-in user: Polls the central 'my-queue' endpoint directly (1 request per poll),
       instead of sending hundreds of individual queries for each position.
-    - For external/anonymous tasks: Strictly throttled polling (max 4 queries/s, max 5 per interval),
-      to never exceed the server rate limit (5 req/s).
+    - For external/anonymous tasks: Strictly throttled polling (max 9-10 queries/s, max 10 per interval),
+      to never exceed the server rate limit (10 req/s).
     """
     if not tracked_tasks:
         return True
@@ -1312,8 +1312,8 @@ def wait_for_completion(
             continue
 
         # --- PATH 2: External or anonymous tasks (throttled!) ---
-        # Check at most 5 tasks per poll step, with 0.25s pause (max 4 req/s)
-        check_batch = list(active_tasks.items())[:5]
+        # Check at most 10 tasks per poll step (throttled to 10 req/s via _rate_limit)
+        check_batch = list(active_tasks.items())[:10]
         finished_keys = []
         leased_count = 0
 
