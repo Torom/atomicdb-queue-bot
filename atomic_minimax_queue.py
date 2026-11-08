@@ -1463,7 +1463,8 @@ def resolve_target_score(
     client: AtomicDBClient,
     root_fen: str,
     target_arg: str,
-    min_target: Optional[int] = None
+    min_target: Optional[int] = None,
+    curr_score: Optional[int] = None
 ) -> Tuple[int, str, Optional[dict]]:
     """
     Resolves the target score (in centipawns) for the given root position.
@@ -1484,8 +1485,9 @@ def resolve_target_score(
     best_rec_val = rec.get('best_value') if rec else None
 
     # Fetch live score to ensure target doesn't lag behind asynchronous record updates
-    data = client.query(root_fen, bypass_cache=True)
-    curr_score = data.get('score') if data else None
+    if curr_score is None:
+        data = client.query(root_fen, bypass_cache=True)
+        curr_score = data.get('score') if data else None
 
     if best_rec_val is not None or curr_score is not None:
         if best_rec_val is not None and curr_score is not None:
@@ -1602,7 +1604,8 @@ def main():
                 client=client,
                 root_fen=effective_root_fen,
                 target_arg=args.target_score,
-                min_target=cur_score + 1
+                min_target=cur_score + 1,
+                curr_score=cur_score
             )
             explorer.target_score = target_score
             logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
@@ -1650,6 +1653,8 @@ def main():
                     if explorer.strategy == "target" and target_score is not None:
                         root_data = client.query(effective_root_fen, bypass_cache=True)
                         cur_score = root_data.get('score') if root_data else None
+
+                        # 1. Live root score achieved the target:
                         if cur_score is not None and cur_score >= target_score:
                             print("\n" + "=" * 80)
                             print(f" 🏆 TARGET ACHIEVED! Root score reached {cur_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
@@ -1658,10 +1663,29 @@ def main():
                                 client=client,
                                 root_fen=effective_root_fen,
                                 target_arg=args.target_score,
-                                min_target=cur_score + 1
+                                min_target=cur_score + 1,
+                                curr_score=cur_score
                             )
                             explorer.target_score = target_score
                             logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
+
+                        # 2. In auto mode, check if /api/roots published a new higher record extreme:
+                        elif args.target_score.lower() == "auto":
+                            fresh_target, fresh_desc, fresh_rec = resolve_target_score(
+                                client=client,
+                                root_fen=effective_root_fen,
+                                target_arg="auto",
+                                min_target=target_score,
+                                curr_score=cur_score
+                            )
+                            if fresh_target > target_score:
+                                rec_val = fresh_rec.get('best_value') if fresh_rec else (fresh_target - 1)
+                                print("\n" + "=" * 80)
+                                print(f" 🏆 NEW RECORD IN /api/roots: {rec_val:+d} cp (Previous target was: {target_score:+d} cp) 🏆")
+                                print("=" * 80 + "\n")
+                                target_score = fresh_target
+                                explorer.target_score = target_score
+                                logger.info(f"Advancing to next target: {target_score:+d} cp ({fresh_desc})\n")
 
                     tracked_tasks = run_cycle(
                         client=client,
