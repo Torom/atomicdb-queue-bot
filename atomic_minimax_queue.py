@@ -1120,16 +1120,16 @@ def run_cycle(
     if not leaves:
         logger.info("No open leaf nodes found (tree is solved or saturated at frontier).")
         if explorer.strategy == "target" and explorer.target_score is not None:
-            orig_target = explorer.target_score
+            orig_margin = explorer.margin_cp
             orig_branching = explorer.defender_branching
-            breaker_target = orig_target + 1
+            breaker_margin = 10
             breaker_branching = 2
             logger.info(
-                f"[BREAKER] Saturated at {orig_target:+d} cp. "
-                f"Trying {breaker_target:+d} cp (def-branch: {breaker_branching})..."
+                f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
+                f"Trying margin: {breaker_margin} cp (def-branch: {breaker_branching})..."
             )
             try:
-                explorer.target_score = breaker_target
+                explorer.margin_cp = breaker_margin
                 explorer.defender_branching = breaker_branching
                 client.query_count = 0
                 breaker_leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
@@ -1146,7 +1146,7 @@ def run_cycle(
                         f"{summary_str} ({client.query_count} queries)."
                     )
             finally:
-                explorer.target_score = orig_target
+                explorer.margin_cp = orig_margin
                 explorer.defender_branching = orig_branching
     else:
         extra_info = [f"{queued_count} queued"]
@@ -1620,6 +1620,31 @@ def main():
             )
         else:
             logger.info("Starting reactive monitoring loop...")
+            if not args.dry_run and client.username and client.password:
+                try:
+                    user_tasks = client.my_queue()
+                    if user_tasks:
+                        logger.info(
+                            f"Found {len(user_tasks)} active task(s) in 'my-queue'. "
+                            "Waiting for cycle trigger..."
+                        )
+                        wait_for_completion(
+                            client=client,
+                            tracked_tasks=[
+                                {
+                                    'task_id': t.get('task_id'),
+                                    'key': t.get('position'),
+                                    'fen': t.get('fen')
+                                }
+                                for t in user_tasks if isinstance(t, dict)
+                            ],
+                            poll_interval=args.poll_interval,
+                            max_wait=args.max_wait
+                        )
+                except KeyboardInterrupt:
+                    logger.info("Terminated by user.")
+                    return
+
             while True:
                 try:
                     if explorer.strategy == "target" and target_score is not None:
@@ -1664,7 +1689,11 @@ def main():
                                 wait_for_completion(
                                     client=client,
                                     tracked_tasks=[
-                                        {'task_id': t.get('task_id'), 'key': t.get('position')}
+                                        {
+                                            'task_id': t.get('task_id'),
+                                            'key': t.get('position'),
+                                            'fen': t.get('fen')
+                                        }
                                         for t in user_tasks if isinstance(t, dict)
                                     ],
                                     poll_interval=args.poll_interval,
