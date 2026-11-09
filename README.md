@@ -20,6 +20,7 @@ Because leaves are submitted immediately as they are discovered during tree trav
 6. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
 7. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
 8. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
+9. **Two-Stage Saturation Breaker**: When the frontier saturates in target mode without finding open leaves, the bot executes an automated two-stage breaker pass using a 10 cp margin (Stage 1 with `defender-branching 1`, escalating to Stage 2 with `defender-branching 2` only if no leaves were queued) before reverting to default settings.
 
 ---
 
@@ -75,7 +76,8 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
 
 - **`--strategy target` (Default, Proof-Frontier / Record Breaking)**:
   Directly aims to break or achieve a target score (by default auto-fetched as `highest_score + 1` from `/atomicdb/api/roots`).
-  For White (attacker), it explores top winning candidates. For Black (defender), it explores **all** unrefuted defenses that hold White below the target score, cutting off branches that already reach the target.
+  For White (attacker), it explores top winning candidates. For Black (defender), it explores unrefuted defenses (up to `--defender-branching 2` by default) that hold White below the target score, cutting off branches that already reach the target.
+  If the tree saturates without finding open leaves, the bot automatically executes a **two-stage saturation breaker** (with 10 cp margin at `defender-branching 1`, escalating to `defender-branching 2` if needed) to unblock frontier leaves.
   Once the target score is achieved in daemon mode, it logs success and automatically advances to the next record!
   ```bash
   # Auto-fetch record from API (e.g. +1255 cp) and queue all leaves needed to reach +1256 cp:
@@ -158,7 +160,7 @@ You can anchor the search at any line or defense variation:
 | `--strategy` | `target` | Traversal strategy (`target` [default], `margin`, `exact`, `and_or`) |
 | `--target-score` | `auto` | Target minimax score in cp (`auto` [default: fetches API record + 1 cp] or explicit integer) |
 | `--margin-cp` | `0` | Centipawn tolerance for near-ties (`0` = strictly best move in `target` mode; `10` in `margin` mode) |
-| `--defender-branching`| `0` | Max defensive moves per AND node (`0` = unlimited [default for `target`], `3` for `and_or`) |
+| `--defender-branching`| `2` | Max defensive moves per AND node (`2` [default], `0` = unlimited) |
 | `--max-depth` | `0` | Max search depth in plies (`0` = unlimited) |
 | `--max-leaves` | `0` | Max leaves to queue per cycle (`0` = unlimited) |
 | `--max-queries` | `0` | Max API queries per cycle (`0` = unlimited) |

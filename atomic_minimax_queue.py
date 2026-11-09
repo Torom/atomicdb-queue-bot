@@ -365,7 +365,7 @@ class MinimaxFrontierExplorer:
         strategy: str = "target",
         target_score: Optional[int] = None,
         margin_cp: int = 10,
-        defender_branching: int = 0,
+        defender_branching: int = 2,
         max_depth: int = 0,
         max_leaves: int = 0,
         max_queries: int = 0,
@@ -1448,8 +1448,8 @@ def parse_arguments():
     parser.add_argument(
         "--defender-branching",
         type=int,
-        default=0,
-        help="Max candidate moves for the opponent/defender to explore at each node (default: 0 = unlimited; 3 in and_or mode)"
+        default=2,
+        help="Max candidate moves for the opponent/defender to explore at each node (default: 2; 0 = unlimited)"
     )
     parser.add_argument("--max-depth", type=int, default=0, help="Max search depth in plies (0 = unlimited, default: 0)")
     parser.add_argument("--max-leaves", type=int, default=0, help="Max leaves per cycle (0 = all discovered, default: 0)")
@@ -1598,7 +1598,7 @@ def main():
         )
 
     eff_margin_cp = 10 if (args.strategy == "margin" and args.margin_cp == 0) else args.margin_cp
-    eff_defender_branching = 3 if (args.strategy == "and_or" and args.defender_branching == 0) else args.defender_branching
+    eff_defender_branching = args.defender_branching
 
     print("================================================================================")
     print("                     ATOMICDB MINIMAX QUEUE BOT                                 ")
