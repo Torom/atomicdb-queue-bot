@@ -1127,69 +1127,36 @@ def run_cycle(
             orig_margin = explorer.margin_cp
             orig_branching = explorer.defender_branching
             breaker_margin = 10
+            breaker_branching = 2
+            logger.info(
+                f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
+                f"Trying margin: {breaker_margin} cp (def-branch: {breaker_branching})..."
+            )
             try:
-                # --- STAGE 1: Breaker with defender_branching = 1 ---
-                stage1_branching = 1
-                logger.info(
-                    f"[BREAKER #1] Saturated at {explorer.target_score:+d} cp. "
-                    f"Trying margin: {breaker_margin} cp (def-branch: {stage1_branching})..."
-                )
                 explorer.margin_cp = breaker_margin
-                explorer.defender_branching = stage1_branching
+                explorer.defender_branching = breaker_branching
                 client.query_count = 0
-                queued_before_stage1 = queued_count
-                analyzed_before_stage1 = already_analyzed_count
-                breaker_leaves_1 = explorer.explore(root_fen, on_leaf=handle_leaf)
+                queued_before_breaker = queued_count
+                analyzed_before_breaker = already_analyzed_count
+                breaker_leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
                 print("=" * 78)
-                stage1_queued = queued_count - queued_before_stage1
-                stage1_analyzed = already_analyzed_count - analyzed_before_stage1
+                breaker_queued = queued_count - queued_before_breaker
+                breaker_analyzed = already_analyzed_count - analyzed_before_breaker
 
-                if stage1_queued > 0:
-                    extra_info = [f"{stage1_queued} queued"]
-                    if stage1_analyzed > 0:
-                        extra_info.append(f"{stage1_analyzed} already analyzed")
+                if not breaker_leaves or breaker_queued == 0:
+                    if not breaker_leaves:
+                        logger.info("[BREAKER] No open leaf nodes found in breaker pass either.")
+                    else:
+                        logger.info(f"[BREAKER] No leaves queued in breaker pass either ({len(breaker_leaves)} found, 0 queued).")
+                else:
+                    extra_info = [f"{breaker_queued} queued"]
+                    if breaker_analyzed > 0:
+                        extra_info.append(f"{breaker_analyzed} already analyzed")
                     summary_str = ", ".join(extra_info)
                     logger.info(
-                        f"[BREAKER #1] Traversal complete: {len(breaker_leaves_1)} leaves found, "
+                        f"[BREAKER] Traversal complete: {len(breaker_leaves)} leaves found, "
                         f"{summary_str} ({client.query_count} queries)."
                     )
-                else:
-                    if not breaker_leaves_1:
-                        logger.info(f"[BREAKER #1] No open leaf nodes found (def-branch: {stage1_branching}).")
-                    else:
-                        logger.info(f"[BREAKER #1] No leaves queued ({len(breaker_leaves_1)} found, 0 queued).")
-
-                    # --- STAGE 2: Breaker with defender_branching = 2 ---
-                    stage2_branching = 2
-                    logger.info(
-                        f"[BREAKER #2] Escalating to margin: {breaker_margin} cp (def-branch: {stage2_branching})..."
-                    )
-                    explorer.defender_branching = stage2_branching
-                    client.query_count = 0
-                    queued_before_stage2 = queued_count
-                    analyzed_before_stage2 = already_analyzed_count
-                    breaker_leaves_2 = explorer.explore(root_fen, on_leaf=handle_leaf)
-                    print("=" * 78)
-                    stage2_queued = queued_count - queued_before_stage2
-                    stage2_analyzed = already_analyzed_count - analyzed_before_stage2
-
-                    if stage2_queued > 0:
-                        extra_info = [f"{stage2_queued} queued"]
-                        if stage2_analyzed > 0:
-                            extra_info.append(f"{stage2_analyzed} already analyzed")
-                        summary_str = ", ".join(extra_info)
-                        logger.info(
-                            f"[BREAKER #2] Traversal complete: {len(breaker_leaves_2)} leaves found, "
-                            f"{summary_str} ({client.query_count} queries)."
-                        )
-                    else:
-                        if not breaker_leaves_2:
-                            logger.info("[BREAKER #2] No open leaf nodes found in breaker pass #2 either.")
-                        else:
-                            logger.info(
-                                f"[BREAKER #2] No leaves queued in breaker pass #2 either "
-                                f"({len(breaker_leaves_2)} found, 0 queued)."
-                            )
             finally:
                 explorer.margin_cp = orig_margin
                 explorer.defender_branching = orig_branching

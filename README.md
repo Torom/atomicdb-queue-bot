@@ -20,7 +20,7 @@ Because leaves are submitted immediately as they are discovered during tree trav
 6. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
 7. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
 8. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
-9. **Two-Stage Saturation Breaker**: When the frontier saturates in target mode without finding open leaves, the bot executes an automated two-stage breaker pass using a 10 cp margin (Stage 1 with `defender-branching 1`, escalating to Stage 2 with `defender-branching 2` only if no leaves were queued) before reverting to default settings.
+9. **Saturation Breaker**: When the frontier saturates in target mode without finding open leaves, the bot executes an automated breaker pass using a 10 cp margin with `--defender-branching 2` before reverting to default settings.
 
 ---
 
@@ -77,7 +77,7 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
 - **`--strategy target` (Default, Proof-Frontier / Record Breaking)**:
   Directly aims to break or achieve a target score (by default auto-fetched as `highest_score + 1` from `/atomicdb/api/roots`).
   For White (attacker), it explores top winning candidates. For Black (defender), it explores unrefuted defenses (up to `--defender-branching 2` by default) that hold White below the target score, cutting off branches that already reach the target.
-  If the tree saturates without finding open leaves, the bot automatically executes a **two-stage saturation breaker** (with 10 cp margin at `defender-branching 1`, escalating to `defender-branching 2` if needed) to unblock frontier leaves.
+  If the tree saturates without finding open leaves, the bot automatically executes a **saturation breaker** (with 10 cp margin at `defender-branching 2`) to unblock frontier leaves.
   Once the target score is achieved in daemon mode, it logs success and automatically advances to the next record!
   ```bash
   # Auto-fetch record from API (e.g. +1255 cp) and queue all leaves needed to reach +1256 cp:
