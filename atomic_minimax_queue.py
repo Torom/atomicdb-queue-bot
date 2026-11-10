@@ -706,17 +706,19 @@ class MinimaxFrontierExplorer:
                     # Child has never been analyzed -> leaf node!
                     # In target strategy, evaluate the leaf strictly against the target score:
                     if self.strategy == "target" and self.target_score is not None and move_score is not None:
-                        # If the value is borrowed (not verified by engine search on this position),
-                        # do not prune it as already meeting the target score!
-                        if not is_borrowed:
-                            # Bottleneck search: We only queue leaves that prevent us from achieving target!
-                            # If the leaf score already suffices for target (White >= target), do not queue!
-                            # 1. Attacker (stm == root_stm) made the move to this leaf: White score is move_score
-                            if stm == root_stm and move_score >= self.target_score:
-                                continue
-                            # 2. Defender (stm != root_stm) made the move to this leaf: White score is -move_score
-                            if stm != root_stm and move_score <= -self.target_score:
-                                continue
+                        # 1. Defender (stm != root_stm) made the move to this leaf: White score is -move_score.
+                        # If White already achieves target score (move_score <= -self.target_score), Black is
+                        # refuted here! We never queue Black moves that already concede the target score (even if borrowed).
+                        # Note: The margin_cp only applies on the way down the tree (in _select_moves), not to leaves!
+                        if stm != root_stm and move_score <= -self.target_score:
+                            continue
+
+                        # 2. Attacker (stm == root_stm) made the move to this leaf: White score is move_score.
+                        # Bottleneck search: We only prune leaves that already achieve target if they are NOT borrowed.
+                        # If borrowed, the server vetoes the unsearched claim (quality=0), so it MUST be searched
+                        # to lift the parent/root score to the target!
+                        if stm == root_stm and not is_borrowed and move_score >= self.target_score:
+                            continue
 
                     if child_fen not in seen_leaves:
                         seen_leaves.add(child_fen)
