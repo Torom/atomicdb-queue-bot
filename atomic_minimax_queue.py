@@ -159,7 +159,7 @@ def wrap_san_path(path_str: str, width: int = 120, indent_len: int = 11, max_col
             lines.append(cur)
         return lines or [path_str]
 
-    cells: List[str] = []
+    cell_parts: List[Tuple[str, str]] = []
     i = 0
     while i < len(tokens):
         if tokens[i].endswith("."):
@@ -168,20 +168,27 @@ def wrap_san_path(path_str: str, width: int = 120, indent_len: int = 11, max_col
                 and not tokens[i + 2].endswith(".")
                 and "..." not in tokens[i + 2]
             ):
-                cells.append(f"{tokens[i]} {tokens[i + 1]} {tokens[i + 2]}")
+                cell_parts.append((tokens[i], f"{tokens[i + 1]} {tokens[i + 2]}"))
                 i += 3
             elif i + 1 < len(tokens):
-                cells.append(f"{tokens[i]} {tokens[i + 1]}")
+                cell_parts.append((tokens[i], tokens[i + 1]))
                 i += 2
             else:
-                cells.append(tokens[i])
+                cell_parts.append((tokens[i], ""))
                 i += 1
         else:
-            cells.append(tokens[i])
+            cell_parts.append(("", tokens[i]))
             i += 1
 
-    if len(cells) <= max_cols and len(" ".join(cells)) <= width - indent_len:
-        return [" ".join(cells)]
+    raw_cells = [f"{num} {mv}".strip() if num else mv for num, mv in cell_parts]
+    if len(raw_cells) <= max_cols and len(" ".join(raw_cells)) <= width - indent_len:
+        return [" ".join(raw_cells)]
+
+    num_width = max((len(num) for num, _ in cell_parts if num), default=0)
+    cells = [
+        f"{num.rjust(num_width)} {mv}".rstrip() if num else mv
+        for num, mv in cell_parts
+    ]
 
     chosen_cols = 1
     chosen_widths = [max(len(c) for c in cells)]
@@ -830,12 +837,13 @@ class MinimaxFrontierExplorer:
                 if sm.get('_is_preferred_pv') and best_move and sm.get('uci') != best_move:
                     sm_san = move_to_san(board, sm.get('uci'))
                     bm_san = move_to_san(board, best_move)
+                    move_num = 1 + (depth + (1 if root_stm == 'b' else 0)) // 2
                     logger.info(
                         f"Preferring 50-move progress move '{sm_san}' over non-progress "
-                        f"best_move '{bm_san}' at depth {depth} (score {sm.get('score'):+d} cp)."
+                        f"best_move '{bm_san}' at move {move_num} (score {sm.get('score'):+d} cp)."
                         if sm.get('score') is not None else
                         f"Preferring 50-move progress move '{sm_san}' over non-progress "
-                        f"best_move '{bm_san}' at depth {depth}."
+                        f"best_move '{bm_san}' at move {move_num}."
                     )
                     break
 
