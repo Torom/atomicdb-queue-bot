@@ -21,14 +21,14 @@ How it works:
 
 import argparse
 import hashlib
-import json
 import logging
 import os
 import sys
+import textwrap
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from heapq import heappop, heappush
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -81,6 +81,39 @@ def canonicalize_fen(fen: str) -> str:
     return fen
 
 
+def format_budget(nodes: int) -> str:
+    """Formats a node budget into compact human-readable notation (e.g. '128M', '2B')."""
+    if nodes >= 1_000_000_000:
+        return f"{nodes // 1_000_000_000}B"
+    return f"{nodes // 1_000_000}M"
+
+
+def push_move_fen(board: chess.Board, move: chess.Move) -> str:
+    """Applies `move` to a stackless copy of `board` and returns its canonicalized FEN."""
+    board_copy = board.copy(stack=False)
+    board_copy.push(move)
+    return canonicalize_fen(board_copy.fen())
+
+
+def replay_path(root_fen: str, path: List[str]) -> Tuple[chess.variant.AtomicBoard, Set[str], str]:
+    """Replays a UCI path from `root_fen` and returns (board, visited_fens, end_fen)."""
+    board = chess.variant.AtomicBoard(root_fen)
+    seen_fens: Set[str] = {canonicalize_fen(board.fen())}
+    for uci in path:
+        board.push(board.parse_uci(uci))
+        seen_fens.add(canonicalize_fen(board.fen()))
+    return board, seen_fens, canonicalize_fen(board.fen())
+
+
+def move_tactical_priority(board: chess.Board, move: chess.Move) -> Tuple[int, int, int]:
+    """Returns (is_capture, gives_check, is_pawn_move) priority flags using python-chess helpers."""
+    return (
+        int(board.is_capture(move)),
+        int(board.gives_check(move)),
+        int(board.piece_type_at(move.from_square) == chess.PAWN),
+    )
+
+
 def resolve_root_fen(base_fen: str, moves_str: Optional[str] = None) -> str:
     """
     Computes the resulting root FEN by playing moves_str (UCI or SAN)
@@ -100,18 +133,12 @@ def resolve_root_fen(base_fen: str, moves_str: Optional[str] = None) -> str:
             if not token:
                 continue
 
-        move_obj = None
         try:
-            m = chess.Move.from_uci(token)
-            if m in board.legal_moves:
-                move_obj = m
-        except Exception:
-            pass
-
-        if move_obj is None:
+            move_obj = board.parse_uci(token)
+        except ValueError:
             try:
                 move_obj = board.parse_san(token)
-            except Exception as e:
+            except ValueError as e:
                 raise ValueError(f"Could not parse move '{token}' from sequence '{moves_str}': {e}")
 
         board.push(move_obj)
@@ -122,14 +149,6 @@ def resolve_root_fen(base_fen: str, moves_str: Optional[str] = None) -> str:
 def key_of(fen: str) -> str:
     """Computes the SHA256 key of a position, as used by AtomicDB."""
     return hashlib.sha256(canonicalize_fen(fen).encode('utf-8')).hexdigest()
-
-
-def is_progress_move(board: chess.Board, move: chess.Move) -> bool:
-    """Returns True if the move resets the 50-move halfmove clock (capture or pawn move)."""
-    if board.is_capture(move):
-        return True
-    piece = board.piece_at(move.from_square)
-    return piece is not None and piece.piece_type == chess.PAWN
 
 
 @dataclass
@@ -472,10 +491,7 @@ class MinimaxFrontierExplorer:
                 if len(candidate_exits) >= max_recovery * 3:
                     break
                 try:
-                    b_att = chess.variant.AtomicBoard(root_fen)
-                    for m_str in att_path:
-                        b_att.push_uci(m_str)
-                    att_fen = canonicalize_fen(b_att.fen())
+                    b_att, _, att_fen = replay_path(root_fen, att_path)
                 except Exception:
                     continue
 
@@ -494,14 +510,8 @@ class MinimaxFrontierExplorer:
                         continue
 
                     try:
-                        b_cand = b_att.copy()
-                        move_obj = chess.Move.from_uci(uci)
-                        is_cap = b_att.is_capture(move_obj)
-                        gives_chk = b_att.gives_check(move_obj)
-                        piece = b_att.piece_at(move_obj.from_square)
-                        is_pawn = piece and piece.piece_type == chess.PAWN
-                        b_cand.push_uci(uci)
-                        cand_fen = canonicalize_fen(b_cand.fen())
+                        move_obj = b_att.parse_uci(uci)
+                        cand_fen = push_move_fen(b_att, move_obj)
                     except Exception:
                         continue
 
@@ -510,7 +520,7 @@ class MinimaxFrontierExplorer:
                     seen_cand_fens.add(cand_fen)
 
                     prio_score = m_score if m_score is not None else -9999
-                    prio_tuple = (prio_score, 1 if is_cap else 0, 1 if gives_chk else 0, 1 if is_pawn else 0)
+                    prio_tuple = (prio_score, *move_tactical_priority(b_att, move_obj))
                     candidate_exits.append((prio_tuple, att_depth + 1, att_path + [uci], cand_fen, m, att_fen))
 
             if candidate_exits:
@@ -540,6 +550,13 @@ class MinimaxFrontierExplorer:
         # Sort leaves: most important and deepest along main variation first
         leaves.sort(key=lambda l: l.priority)
         return leaves
+
+    def _resolve_effective_visits(self, move: dict, child_fen: str) -> int:
+        """Returns cached visit count when available (>0), otherwise the parent edge's visits."""
+        cached_child = self.client.cache.get(child_fen)
+        if cached_child is not None and cached_child.get('visits', 0) > 0:
+            return cached_child['visits']
+        return move.get('visits', 0)
 
     def _is_no_progress_draw_active(self, effective_min_score: Optional[int]) -> bool:
         """Returns True if hitting max_no_progress should be pruned as a 50-move draw."""
@@ -730,10 +747,8 @@ class MinimaxFrontierExplorer:
                 uci = m['uci']
                 try:
                     move_obj = chess.Move.from_uci(uci)
-                    is_prog = is_progress_move(board, move_obj)
-                    board_copy = board.copy()
-                    board_copy.push(move_obj)
-                    child_fen = canonicalize_fen(board_copy.fen())
+                    is_prog = board.is_zeroing(move_obj)
+                    child_fen = push_move_fen(board, move_obj)
                 except Exception as ex:
                     logger.warning(f"Could not execute move {uci} on {fen}: {ex}")
                     continue
@@ -802,10 +817,8 @@ class MinimaxFrontierExplorer:
                         continue
                     try:
                         move_obj = chess.Move.from_uci(uci)
-                        is_prog = is_progress_move(board, move_obj)
-                        board_copy = board.copy()
-                        board_copy.push(move_obj)
-                        c_fen = canonicalize_fen(board_copy.fen())
+                        is_prog = board.is_zeroing(move_obj)
+                        c_fen = push_move_fen(board, move_obj)
                     except Exception:
                         continue
 
@@ -817,10 +830,7 @@ class MinimaxFrontierExplorer:
                         continue
                     cand_lpd = (depth + 1) if is_prog else last_progress_depth
 
-                    m_visits = m.get('visits', 0)
-                    cached_c = self.client.cache.get(c_fen)
-                    if cached_c is not None and cached_c.get('visits', 0) > 0:
-                        m_visits = cached_c.get('visits', 0)
+                    m_visits = self._resolve_effective_visits(m, c_fen)
                     m_score = m.get('score')
                     if m_visits > 0 or m_score is not None:
                         if self.skip_zero_cp and m_score == 0:
@@ -838,11 +848,11 @@ class MinimaxFrontierExplorer:
                             and (m.get('borrowed', False) or (node_score is not None and m_score > node_score))
                         )
                         if is_vetoed_claim:
-                            non_cyclic_unvisited.append((m, c_fen, board_copy, cand_np, cand_lpd))
+                            non_cyclic_unvisited.append((m, c_fen, cand_np, cand_lpd))
                         else:
                             non_cyclic_scored.append((m, c_fen, cand_np, cand_lpd))
                     else:
-                        non_cyclic_unvisited.append((m, c_fen, board_copy, cand_np, cand_lpd))
+                        non_cyclic_unvisited.append((m, c_fen, cand_np, cand_lpd))
 
                 # Path 1: Scored non-cyclic moves exist
                 if non_cyclic_scored:
@@ -865,24 +875,20 @@ class MinimaxFrontierExplorer:
                 # When all analyzed moves loop, unanalyzed moves are the only way to break the cycle ('cycle_exit')!
                 if not valid_candidates and non_cyclic_unvisited:
                     def unvisited_priority(item):
-                        m_cand, _c_fen, _b_copy, _np, _lpd = item
+                        m_cand = item[0]
                         m_cand_score = m_cand.get('score')
                         has_score = 1 if m_cand_score is not None else 0
                         score_val = m_cand_score if m_cand_score is not None else -99999
                         try:
-                            move_obj = chess.Move.from_uci(m_cand['uci'])
-                            is_cap = board.is_capture(move_obj)
-                            gives_chk = board.gives_check(move_obj)
-                            piece = board.piece_at(move_obj.from_square)
-                            is_pawn = piece and piece.piece_type == chess.PAWN
-                            return (has_score, score_val, 1 if is_cap else 0, 1 if gives_chk else 0, 1 if is_pawn else 0)
+                            tactical = move_tactical_priority(board, chess.Move.from_uci(m_cand['uci']))
+                            return (has_score, score_val, *tactical)
                         except Exception:
                             return (has_score, score_val, 0, 0, 0)
 
                     non_cyclic_unvisited.sort(key=unvisited_priority, reverse=True)
                     # Queue up to 5 unanalyzed exit moves as leaf candidates
                     max_exits = 5 if (self.max_leaves == 0 or self.max_leaves > 5) else self.max_leaves
-                    for m, c_fen, _, cand_np, cand_lpd in non_cyclic_unvisited[:max_exits]:
+                    for m, c_fen, cand_np, cand_lpd in non_cyclic_unvisited[:max_exits]:
                         m_copy = dict(m)
                         m_copy['_is_cycle_exit'] = True
                         valid_candidates.append((m_copy, c_fen, cand_np, cand_lpd))
@@ -899,10 +905,7 @@ class MinimaxFrontierExplorer:
 
             for m, child_fen, new_no_progress, new_last_prog_depth in valid_candidates:
                 uci = m['uci']
-                move_visits = m.get('visits', 0)
-                cached_child = self.client.cache.get(child_fen)
-                if cached_child is not None and cached_child.get('visits', 0) > 0:
-                    move_visits = cached_child.get('visits', 0)
+                move_visits = self._resolve_effective_visits(m, child_fen)
                 move_score = m.get('score')
                 move_backed = m.get('backed_plies', 0)
                 new_path = path + [uci]
@@ -1029,12 +1032,7 @@ class MinimaxFrontierExplorer:
                 break
 
             try:
-                b_att = chess.variant.AtomicBoard(root_fen)
-                att_path_fens: Set[str] = {root_fen}
-                for m_str in att_path:
-                    b_att.push_uci(m_str)
-                    att_path_fens.add(canonicalize_fen(b_att.fen()))
-                att_fen = canonicalize_fen(b_att.fen())
+                b_att, att_path_fens, att_fen = replay_path(root_fen, att_path)
             except Exception:
                 continue
 
@@ -1061,23 +1059,18 @@ class MinimaxFrontierExplorer:
 
                 try:
                     move_obj = chess.Move.from_uci(uci)
-                    is_prog = is_progress_move(b_att, move_obj)
+                    is_prog = b_att.is_zeroing(move_obj)
                     next_no_prog = 0 if is_prog else (no_prog_at_att + 1)
                     if self.max_no_progress > 0 and next_no_prog >= self.max_no_progress:
                         continue
-                    b_cand = b_att.copy()
-                    b_cand.push(move_obj)
-                    cand_fen = canonicalize_fen(b_cand.fen())
+                    cand_fen = push_move_fen(b_att, move_obj)
                 except Exception:
                     continue
 
                 if cand_fen in att_path_fens or cand_fen in seen_cand_fens:
                     continue
 
-                m_visits = m.get('visits', 0)
-                cached_child = self.client.cache.get(cand_fen)
-                if cached_child is not None and cached_child.get('visits', 0) > 0:
-                    m_visits = cached_child.get('visits', 0)
+                m_visits = self._resolve_effective_visits(m, cand_fen)
 
                 if m_visits == 0:
                     if cand_fen in seen_leaves or cand_fen in self.known_analyzed_fens:
@@ -1105,10 +1098,7 @@ class MinimaxFrontierExplorer:
                 else:
                     continue
 
-                is_cap = 1 if b_att.is_capture(move_obj) else 0
-                gives_chk = 1 if b_att.gives_check(move_obj) else 0
-                piece = b_att.piece_at(move_obj.from_square)
-                is_pawn = 1 if (piece is not None and piece.piece_type == chess.PAWN) else 0
+                is_cap, gives_chk, is_pawn = move_tactical_priority(b_att, move_obj)
                 score_rank = m_score if m_score is not None else -99999
 
                 sort_key = (
@@ -1227,7 +1217,7 @@ class MinimaxFrontierExplorer:
             if not uci:
                 return False
             try:
-                return is_progress_move(board, chess.Move.from_uci(uci))
+                return board.is_zeroing(chess.Move.from_uci(uci))
             except Exception:
                 return False
 
@@ -1379,42 +1369,24 @@ class MinimaxFrontierExplorer:
                 m for m in scored_moves
                 if m['score'] == best_score and m.get('status') == 'UNKNOWN'
             ]
-        elif self.strategy == "margin":
-            # All moves within margin_cp
-            selected = [
-                m for m in scored_moves
-                if m['score'] >= best_score - self.margin_cp and m.get('status') == 'UNKNOWN'
-            ]
-            # Transposition/cycle resilience: If top move loops into a repetition, keep up
-            # to 2 moves (within 30 cp) as lower-priority backups in tree:
-            if stm == root_stm and len(selected) < 2:
-                backup_margin = max(self.margin_cp, 30)
-                selected = [
-                    m for m in scored_moves
-                    if m['score'] >= best_score - backup_margin and m.get('status') == 'UNKNOWN'
-                ][:2]
-        elif self.strategy == "and_or":
-            # Proof-Number / Solving logic:
-            # Root player (attacker) wants to win -> selects top moves
-            # Opponent (defender) wants to survive -> all unsolved moves must be checked
-            if stm == root_stm:
-                # OR node: Top moves within tight margin
+        elif self.strategy in ("margin", "and_or"):
+            if stm == root_stm or self.strategy == "margin":
                 selected = [
                     m for m in scored_moves
                     if m['score'] >= best_score - self.margin_cp and m.get('status') == 'UNKNOWN'
                 ]
-                if len(selected) < 2:
+                # Transposition/cycle resilience: keep up to 2 attacker moves within 30 cp as backups
+                if stm == root_stm and len(selected) < 2:
                     backup_margin = max(self.margin_cp, 30)
                     selected = [
                         m for m in scored_moves
                         if m['score'] >= best_score - backup_margin and m.get('status') == 'UNKNOWN'
                     ][:2]
             else:
-                # AND node: Toughest defensive moves
+                # AND node in and_or: toughest unsolved defensive moves
                 unsolved = [m for m in moves if m.get('status') == 'UNKNOWN']
                 if self.skip_zero_cp:
                     unsolved = [m for m in unsolved if m.get('score') != 0]
-                # Sort by best score for defender (highest score = toughest defense)
                 unsolved.sort(key=lambda m: (m.get('score') is not None, m.get('score', -99999)), reverse=True)
                 selected = unsolved[:self.defender_branching]
         else:
@@ -1435,25 +1407,6 @@ class MinimaxFrontierExplorer:
             ))
 
         return selected
-
-
-def print_leaf_report(leaves: List[LeafCandidate]):
-    """Prints a structured summary of discovered leaf nodes."""
-    print("\n" + "=" * 78)
-    print(f" DISCOVERED MINIMAX LEAF NODES: {len(leaves)}")
-    print("=" * 78)
-
-    if not leaves:
-        print(" No open leaf nodes found (tree is solved or saturated at current frontier).")
-        return
-
-    for idx, leaf in enumerate(leaves, 1):
-        path_str = " ".join(leaf.path) if leaf.path else "(Root)"
-        score_str = f"{leaf.score:+d} cp" if leaf.score is not None else "N/A"
-        print(f"[{idx:02d}] Depth: {leaf.depth:2d} plies | Score: {score_str:>8} | Reason: {leaf.reason}")
-        print(f"     Path: {path_str}")
-        print(f"     FEN : {leaf.fen}")
-        print("-" * 78)
 
 
 def run_cycle(
@@ -1497,7 +1450,6 @@ def run_cycle(
             f"Score: {score_str:>8} | Reason: {leaf.reason}"
         )
         if len(path_str) > 105:
-            import textwrap
             wrapped = textwrap.wrap(path_str, width=105)
             print(f"     Path: {wrapped[0]}")
             for p_line in wrapped[1:]:
@@ -1525,7 +1477,7 @@ def run_cycle(
             explorer.known_analyzed_fens.add(leaf.fen)
             already_analyzed_count += 1
             completed_budget = resp.get('completed_budget')
-            b_label = f"{completed_budget // 1_000_000_000}B" if completed_budget and completed_budget >= 1_000_000_000 else f"{completed_budget // 1_000_000}M" if completed_budget else "?"
+            b_label = format_budget(completed_budget) if completed_budget else "?"
             print(f"     --> Status: {status} (already analyzed with {b_label} nodes)\n")
             return
 
@@ -1533,8 +1485,8 @@ def run_cycle(
         # If the server unexpectedly assigns more than the allowed budget (> 128M),
         # cancel the task immediately!
         if budget_nodes and budget_nodes > max_allowed_budget:
-            b_str = f"{budget_nodes // 1_000_000_000}B" if budget_nodes >= 1_000_000_000 else f"{budget_nodes // 1_000_000}M"
-            max_str = f"{max_allowed_budget // 1_000_000_000}B" if max_allowed_budget >= 1_000_000_000 else f"{max_allowed_budget // 1_000_000}M"
+            b_str = format_budget(budget_nodes)
+            max_str = format_budget(max_allowed_budget)
             if status == 'queued' and task_id:
                 cancel_resp = client.cancel_task(task_id)
                 cancel_st = cancel_resp.get('status', 'unknown')
@@ -1556,8 +1508,7 @@ def run_cycle(
         if task_state:
             extra.append(f"Status: {task_state}")
         if budget_nodes:
-            b_label = f"{budget_nodes // 1_000_000_000}B" if budget_nodes >= 1_000_000_000 else f"{budget_nodes // 1_000_000}M"
-            extra.append(b_label)
+            extra.append(format_budget(budget_nodes))
         if ahead != '':
             extra.append(f"Queue pos: {ahead}")
         if reason:
@@ -2006,6 +1957,35 @@ def resolve_target_score(
     return target, f"default advantage target: {target:+d} cp", None
 
 
+def _wait_for_existing_user_queue(
+    client: AtomicDBClient,
+    poll_interval: int,
+    max_wait: int,
+    log_msg: str
+) -> bool:
+    """If the user has active tasks in `my-queue`, waits for them and returns True."""
+    if not (client.username and client.password):
+        return False
+    user_tasks = client.my_queue()
+    if not user_tasks:
+        return False
+    logger.info(log_msg.format(count=len(user_tasks)))
+    wait_for_completion(
+        client=client,
+        tracked_tasks=[
+            {
+                'task_id': t.get('task_id'),
+                'key': t.get('position'),
+                'fen': t.get('fen'),
+            }
+            for t in user_tasks if isinstance(t, dict)
+        ],
+        poll_interval=poll_interval,
+        max_wait=max_wait,
+    )
+    return True
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -2015,9 +1995,9 @@ def main():
     args = parse_arguments()
 
     target_budget = args.budget if args.budget is not None else 128_000_000
-    max_allowed_budget = args.budget if args.budget is not None else 128_000_000
+    max_allowed_budget = target_budget
 
-    b_label = f"{target_budget // 1_000_000_000}B nodes" if target_budget >= 1_000_000_000 else f"{target_budget // 1_000_000}M nodes"
+    b_label = f"{format_budget(target_budget)} nodes"
     if args.budget is None:
         b_label += " (default limit: max 128M)"
     else:
@@ -2117,27 +2097,12 @@ def main():
             )
         else:
             logger.info("Starting reactive monitoring loop...")
-            if not args.dry_run and client.username and client.password:
+            if not args.dry_run:
                 try:
-                    user_tasks = client.my_queue()
-                    if user_tasks:
-                        logger.info(
-                            f"Found {len(user_tasks)} active task(s) in 'my-queue'. "
-                            "Waiting for cycle trigger..."
-                        )
-                        wait_for_completion(
-                            client=client,
-                            tracked_tasks=[
-                                {
-                                    'task_id': t.get('task_id'),
-                                    'key': t.get('position'),
-                                    'fen': t.get('fen')
-                                }
-                                for t in user_tasks if isinstance(t, dict)
-                            ],
-                            poll_interval=args.poll_interval,
-                            max_wait=args.max_wait
-                        )
+                    _wait_for_existing_user_queue(
+                        client, args.poll_interval, args.max_wait,
+                        "Found {count} active task(s) in 'my-queue'. Waiting for cycle trigger..."
+                    )
                 except KeyboardInterrupt:
                     logger.info("Terminated by user.")
                     return
@@ -2197,27 +2162,11 @@ def main():
                         continue
 
                     if not tracked_tasks:
-                        if client.username and client.password:
-                            user_tasks = client.my_queue()
-                            if user_tasks:
-                                logger.info(
-                                    f"{len(user_tasks)} active task(s) found in 'my-queue'. "
-                                    "Waiting for completion..."
-                                )
-                                wait_for_completion(
-                                    client=client,
-                                    tracked_tasks=[
-                                        {
-                                            'task_id': t.get('task_id'),
-                                            'key': t.get('position'),
-                                            'fen': t.get('fen')
-                                        }
-                                        for t in user_tasks if isinstance(t, dict)
-                                    ],
-                                    poll_interval=args.poll_interval,
-                                    max_wait=args.max_wait
-                                )
-                                continue
+                        if _wait_for_existing_user_queue(
+                            client, args.poll_interval, args.max_wait,
+                            "{count} active task(s) found in 'my-queue'. Waiting for completion..."
+                        ):
+                            continue
 
                         logger.info(f"No active tasks to monitor. Waiting {args.idle_interval}s before next check...")
                         time.sleep(args.idle_interval)
