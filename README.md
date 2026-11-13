@@ -17,10 +17,11 @@ Because leaves are submitted immediately as they are discovered during tree trav
 3. **Near-Tie Exploration (`margin`)**: The tree frequently features moves that share the top score or differ by only a few centipawns. The bot explores these near-optimal alternatives within a configurable margin.
 4. **Game-Theoretic AND/OR Proof Search (`and_or`)**: When solving an advantage (e.g. White winning after `1. Nf3`), the attacker (OR node) plays the best moves while the defender (AND node) must have every legal response refuted. The bot systematically identifies and refutes defensive tries.
 5. **Cycle & Transposition Handling**: Detects repetition loops in the database and breaks cycles cleanly (`cycle_exit`) by queuing unanalyzed alternative moves.
-6. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
-7. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
-8. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
-9. **Saturation Breaker**: When the frontier saturates in target mode without finding open leaves, the bot executes an automated breaker pass using a 10 cp margin with `--defender-branching 2` before reverting to default settings.
+6. **50-Move Progress Recovery**: Detects non-progress shuffling stretches (default 100 plies without captures or pawn moves via `--max-no-progress`), avoids queuing dead 50-move draws, and steers the attacker toward real-progress paths (`progress_exit`) while deepening promising alternatives until the database prefers them.
+7. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
+8. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
+9. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
+10. **Saturation Breaker**: When the frontier saturates in target mode without finding open leaves, the bot executes an automated multi-stage breaker pass (escalating defender-branching to 2, starting with 0 cp margin if branching was 1, then escalating margin up to 10 cp), immediately reverting to base settings as soon as an unanalyzed leaf is queued.
 
 ---
 
@@ -77,7 +78,7 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
 - **`--strategy target` (Default, Proof-Frontier / Record Breaking)**:
   Directly aims to break or achieve a target score (by default auto-fetched as `highest_score + 1` from `/atomicdb/api/roots`).
   For White (attacker), it explores top winning candidates. For Black (defender), it explores unrefuted defenses (up to `--defender-branching 2` by default) that hold White below the target score, cutting off branches that already reach the target.
-  If the tree saturates without finding open leaves, the bot automatically executes a **saturation breaker** (with 10 cp margin at `defender-branching 2`) to unblock frontier leaves.
+  If the tree saturates without finding open leaves, the bot automatically executes a **saturation breaker** (escalating defender-branching to 2, testing 0 cp margin if branching was 1, then escalating margin from 1 cp up to 10 cp) to unblock frontier leaves, reverting to base settings as soon as a leaf is queued.
   Once the target score is achieved in daemon mode, it logs success and automatically advances to the next record!
   ```bash
   # Auto-fetch record from API (e.g. +1255 cp) and queue all leaves needed to reach +1256 cp:

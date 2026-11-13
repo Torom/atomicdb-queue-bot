@@ -124,13 +124,21 @@ def key_of(fen: str) -> str:
     return hashlib.sha256(canonicalize_fen(fen).encode('utf-8')).hexdigest()
 
 
+def is_progress_move(board: chess.Board, move: chess.Move) -> bool:
+    """Returns True if the move resets the 50-move halfmove clock (capture or pawn move)."""
+    if board.is_capture(move):
+        return True
+    piece = board.piece_at(move.from_square)
+    return piece is not None and piece.piece_type == chess.PAWN
+
+
 @dataclass
 class LeafCandidate:
     fen: str
     path: List[str]
     depth: int
     score: Optional[int]
-    reason: str  # 'not_in_db', 'zero_visits', 'child_zero_visits', 'cycle_exit'
+    reason: str  # 'not_in_db', 'zero_visits', 'child_zero_visits', 'cycle_exit', 'progress_exit'
     parent_fen: Optional[str] = None
     priority: float = 0.0
 
@@ -370,7 +378,8 @@ class MinimaxFrontierExplorer:
         max_leaves: int = 0,
         max_queries: int = 0,
         skip_zero_cp: bool = True,
-        min_score: Optional[int] = None
+        min_score: Optional[int] = None,
+        max_no_progress: int = 100
     ):
         self.client = client
         self.strategy = strategy
@@ -382,6 +391,7 @@ class MinimaxFrontierExplorer:
         self.max_queries = max_queries  # 0 = unlimited
         self.skip_zero_cp = skip_zero_cp
         self.min_score = min_score
+        self.max_no_progress = max_no_progress  # 0 = disabled
         self.known_analyzed_fens: Set[str] = set()
 
     def explore(
@@ -397,9 +407,10 @@ class MinimaxFrontierExplorer:
         """
         root_fen = canonicalize_fen(root_fen)
         root_stm = root_fen.split()[1] if len(root_fen.split()) > 1 else 'w'
-        leaves: List[LeafCandidate] = []
         seen_leaves: Set[str] = set()
+        visited_nodes: Set[str] = set()
         cycle_attacker_events: List[Tuple[int, List[str]]] = []
+        no_progress_events: List[Tuple[int, int, List[str], bool]] = []
 
         # Effective min_score:
         # If user explicitly specified min_score, use it.
@@ -410,15 +421,159 @@ class MinimaxFrontierExplorer:
         effective_min_score: Optional[int] = self.min_score
         min_score_initialized = (self.min_score is not None)
 
-        # Priority Queue for open search nodes: (priority, depth, path, path_fens, fen, is_pv)
-        frontier = []
-        heappush(frontier, (0.0, 0, [], {root_fen}, root_fen, True))
-        visited_nodes: Set[str] = set()
+        # Frontier node tuple:
+        # (priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth)
+        initial_nodes = [(0.0, 0, [], {root_fen}, root_fen, True, 0, 0)]
+        leaves, effective_min_score, min_score_initialized = self._traverse_frontier(
+            initial_nodes=initial_nodes,
+            root_stm=root_stm,
+            effective_min_score=effective_min_score,
+            min_score_initialized=min_score_initialized,
+            seen_leaves=seen_leaves,
+            visited_nodes=visited_nodes,
+            cycle_attacker_events=cycle_attacker_events,
+            no_progress_events=no_progress_events,
+            on_leaf=on_leaf,
+            max_leaves_limit=self.max_leaves
+        )
 
-        last_logged_query = 0
+        # 50-move / Non-Progress Recovery:
+        # If PV or all active branches hit max_no_progress without finding open leaves,
+        # steer the attacker away from the shuffling trap toward real progress moves
+        # (and deepen promising progress alternatives across cycles).
+        pv_hit_no_progress = any(ev[3] for ev in no_progress_events)
+        if (not leaves or pv_hit_no_progress) and no_progress_events:
+            if self.max_leaves == 0 or len(leaves) < self.max_leaves:
+                remaining_leaves = (self.max_leaves - len(leaves)) if self.max_leaves > 0 else 0
+                progress_leaves = self._recover_no_progress_branches(
+                    root_fen=root_fen,
+                    root_stm=root_stm,
+                    effective_min_score=effective_min_score,
+                    seen_leaves=seen_leaves,
+                    visited_nodes=visited_nodes,
+                    no_progress_events=no_progress_events,
+                    on_leaf=on_leaf,
+                    max_leaves_remaining=remaining_leaves
+                )
+                leaves.extend(progress_leaves)
+
+        # Cycle Trap Recovery (Cycle-Exit Recovery):
+        # If minimax search found no open leaves because all active branches
+        # starved in closed repetition cycles:
+        # Extract unanalyzed exit moves ('cycle_exit') from attacker cycle nodes
+        # to actively break the cycle in the database!
+        if not leaves and cycle_attacker_events:
+            cycle_attacker_events.sort(key=lambda item: item[0], reverse=True)
+            max_recovery = 5 if (self.max_leaves == 0 or self.max_leaves > 5) else self.max_leaves
+
+            candidate_exits = []
+            seen_cand_fens = set()
+            for att_depth, att_path in cycle_attacker_events:
+                if len(candidate_exits) >= max_recovery * 3:
+                    break
+                try:
+                    b_att = chess.variant.AtomicBoard(root_fen)
+                    for m_str in att_path:
+                        b_att.push_uci(m_str)
+                    att_fen = canonicalize_fen(b_att.fen())
+                except Exception:
+                    continue
+
+                att_data = self.client.query(att_fen)
+                if not att_data:
+                    continue
+
+                for m in att_data.get('moves', []):
+                    uci = m.get('uci')
+                    if not uci or m.get('floor', False) or m.get('status') not in ('UNKNOWN', None):
+                        continue
+                    if m.get('visits', 0) > 0:
+                        continue
+                    m_score = m.get('score')
+                    if self.skip_zero_cp and m_score is not None and m_score == 0:
+                        continue
+
+                    try:
+                        b_cand = b_att.copy()
+                        move_obj = chess.Move.from_uci(uci)
+                        is_cap = b_att.is_capture(move_obj)
+                        gives_chk = b_att.gives_check(move_obj)
+                        piece = b_att.piece_at(move_obj.from_square)
+                        is_pawn = piece and piece.piece_type == chess.PAWN
+                        b_cand.push_uci(uci)
+                        cand_fen = canonicalize_fen(b_cand.fen())
+                    except Exception:
+                        continue
+
+                    if cand_fen in seen_leaves or cand_fen in seen_cand_fens or cand_fen in self.known_analyzed_fens:
+                        continue
+                    seen_cand_fens.add(cand_fen)
+
+                    prio_score = m_score if m_score is not None else -9999
+                    prio_tuple = (prio_score, 1 if is_cap else 0, 1 if gives_chk else 0, 1 if is_pawn else 0)
+                    candidate_exits.append((prio_tuple, att_depth + 1, att_path + [uci], cand_fen, m, att_fen))
+
+            if candidate_exits:
+                candidate_exits.sort(key=lambda x: x[0], reverse=True)
+                for _, depth_val, path_val, cand_fen, m_dict, parent_fen_val in candidate_exits[:max_recovery]:
+                    if cand_fen not in seen_leaves:
+                        seen_leaves.add(cand_fen)
+                        leaf = LeafCandidate(
+                            fen=cand_fen,
+                            path=path_val,
+                            depth=depth_val,
+                            score=m_dict.get('score'),
+                            reason='cycle_exit',
+                            parent_fen=parent_fen_val,
+                            priority=-depth_val * 1000.0
+                        )
+                        leaves.append(leaf)
+                        if on_leaf:
+                            on_leaf(leaf)
+
+                if leaves:
+                    logger.info(
+                        f"Cycle trap resolved: {len(leaves)} unanalyzed exit moves ('cycle_exit') "
+                        f"found at depth {leaves[0].depth} to break repetition."
+                    )
+
+        # Sort leaves: most important and deepest along main variation first
+        leaves.sort(key=lambda l: l.priority)
+        return leaves
+
+    def _is_no_progress_draw_active(self, effective_min_score: Optional[int]) -> bool:
+        """Returns True if hitting max_no_progress should be pruned as a 50-move draw."""
+        if self.max_no_progress <= 0:
+            return False
+        return (
+            self.skip_zero_cp
+            or (self.strategy == "target" and self.target_score is not None and self.target_score > 0)
+            or (effective_min_score is not None and effective_min_score > 0)
+        )
+
+    def _traverse_frontier(
+        self,
+        initial_nodes: List[Tuple[float, int, List[str], Set[str], str, bool, int, int]],
+        root_stm: str,
+        effective_min_score: Optional[int],
+        min_score_initialized: bool,
+        seen_leaves: Set[str],
+        visited_nodes: Set[str],
+        cycle_attacker_events: List[Tuple[int, List[str]]],
+        no_progress_events: List[Tuple[int, int, List[str], bool]],
+        on_leaf: Optional[Callable[[LeafCandidate], None]] = None,
+        max_leaves_limit: int = 0
+    ) -> Tuple[List[LeafCandidate], Optional[int], bool]:
+        """Executes priority-queue minimax traversal from initial_nodes and returns discovered leaves."""
+        leaves: List[LeafCandidate] = []
+        frontier: List[Tuple[float, int, List[str], Set[str], str, bool, int, int]] = []
+        for node in initial_nodes:
+            heappush(frontier, node)
+
+        last_logged_query = self.client.query_count
         while frontier:
-            if self.max_leaves > 0 and len(leaves) >= self.max_leaves:
-                logger.info(f"Max leaves limit ({self.max_leaves}) reached. Terminating traversal early.")
+            if max_leaves_limit > 0 and len(leaves) >= max_leaves_limit:
+                logger.info(f"Max leaves limit ({max_leaves_limit}) reached. Terminating traversal early.")
                 break
 
             if self.max_queries > 0 and self.client.query_count >= self.max_queries:
@@ -434,9 +589,12 @@ class MinimaxFrontierExplorer:
                     f"Open nodes: {len(frontier)}"
                 )
 
-            priority, depth, path, path_fens, fen, is_pv = heappop(frontier)
+            priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth = heappop(frontier)
 
             if self.max_depth > 0 and depth > self.max_depth:
+                continue
+
+            if depth > 0 and self._is_no_progress_draw_active(effective_min_score) and no_progress_plies >= self.max_no_progress:
                 continue
 
             if fen in visited_nodes:
@@ -530,13 +688,21 @@ class MinimaxFrontierExplorer:
                 # Position already has visits (>0) but no legal follow-up moves (terminal/dead end)
                 continue
 
+            # Build board before move selection so attacker ties can prefer 50-move-resetting moves
+            try:
+                board = chess.variant.AtomicBoard(fen)
+            except Exception as e:
+                logger.error(f"Invalid FEN {fen}: {e}")
+                continue
+
             # Select moves to follow according to chosen strategy
             selected_moves = self._select_moves(
                 stm, moves, best_move,
                 root_stm=root_stm,
                 node_score=node_score,
                 effective_min_score=effective_min_score,
-                is_pv=is_pv
+                is_pv=is_pv,
+                board=board
             )
 
             if not selected_moves:
@@ -544,34 +710,70 @@ class MinimaxFrontierExplorer:
                     logger.debug(f"Branch secured at depth {depth}: all defender responses meet target score.")
                 continue
 
-            # Execute selected follow-up moves on the board
-            try:
-                board = chess.variant.AtomicBoard(fen)
-            except Exception as e:
-                logger.error(f"Invalid FEN {fen}: {e}")
-                continue
+            for sm in selected_moves:
+                if sm.get('_is_preferred_pv') and best_move and sm.get('uci') != best_move:
+                    logger.info(
+                        f"Preferring 50-move progress move '{sm.get('uci')}' over non-progress "
+                        f"best_move '{best_move}' at depth {depth} (score {sm.get('score'):+d} cp)."
+                        if sm.get('score') is not None else
+                        f"Preferring 50-move progress move '{sm.get('uci')}' over non-progress "
+                        f"best_move '{best_move}' at depth {depth}."
+                    )
+                    break
 
-            # Check which selected moves do not lead to a path repetition (cycle)
+            # Check which selected moves avoid path repetition (cycle) and 50-move no-progress limit
+            enforce_no_progress = self._is_no_progress_draw_active(effective_min_score)
             valid_candidates = []
             repeated_fens = []
+            no_progress_hits = []
             for m in selected_moves:
                 uci = m['uci']
                 try:
+                    move_obj = chess.Move.from_uci(uci)
+                    is_prog = is_progress_move(board, move_obj)
                     board_copy = board.copy()
-                    board_copy.push_uci(uci)
+                    board_copy.push(move_obj)
                     child_fen = canonicalize_fen(board_copy.fen())
                 except Exception as ex:
                     logger.warning(f"Could not execute move {uci} on {fen}: {ex}")
                     continue
 
-                if child_fen not in path_fens:
-                    valid_candidates.append((m, child_fen))
-                else:
+                if child_fen in path_fens:
                     repeated_fens.append(child_fen)
                     logger.debug(f"Move {uci} leads to repetition (position already on path).")
+                    continue
+
+                new_no_progress = 0 if is_prog else (no_progress_plies + 1)
+                if enforce_no_progress and new_no_progress >= self.max_no_progress:
+                    no_progress_hits.append((m, child_fen))
+                    continue
+
+                new_last_prog_depth = (depth + 1) if is_prog else last_progress_depth
+                valid_candidates.append((m, child_fen, new_no_progress, new_last_prog_depth))
+
+            if no_progress_hits:
+                pv_hit_here = is_pv and (
+                    best_move is None or any(m.get('uci') == best_move for m, _ in no_progress_hits)
+                )
+                if pv_hit_here or not valid_candidates:
+                    no_progress_events.append((depth, last_progress_depth, path, is_pv or pv_hit_here))
+                if not valid_candidates:
+                    logger.info(
+                        f"No-progress limit ({self.max_no_progress} plies) reached at depth {depth} "
+                        f"(since ply {last_progress_depth}) -> branch treated as 50-move draw."
+                    )
+                    continue
 
             # If ALL selected moves lead to a repetition (draw):
             if not valid_candidates:
+                if enforce_no_progress and no_progress_plies >= max(1, self.max_no_progress // 2):
+                    logger.info(
+                        f"Repetition at depth {depth} after {no_progress_plies} plies without progress "
+                        f"(since ply {last_progress_depth}) -> deferred to progress recovery."
+                    )
+                    no_progress_events.append((depth, last_progress_depth, path, is_pv))
+                    continue
+
                 if stm != root_stm:
                     # Defender forces a draw by repetition (0 cp).
                     # In minimax, a losing defender chooses a draw over losing non-cyclic moves.
@@ -599,8 +801,10 @@ class MinimaxFrontierExplorer:
                     if not uci or m.get('floor', False) or m.get('status') not in ('UNKNOWN', None):
                         continue
                     try:
+                        move_obj = chess.Move.from_uci(uci)
+                        is_prog = is_progress_move(board, move_obj)
                         board_copy = board.copy()
-                        board_copy.push_uci(uci)
+                        board_copy.push(move_obj)
                         c_fen = canonicalize_fen(board_copy.fen())
                     except Exception:
                         continue
@@ -608,16 +812,37 @@ class MinimaxFrontierExplorer:
                     if c_fen in path_fens:
                         continue  # Circular / repetition
 
+                    cand_np = 0 if is_prog else (no_progress_plies + 1)
+                    if enforce_no_progress and cand_np >= self.max_no_progress:
+                        continue
+                    cand_lpd = (depth + 1) if is_prog else last_progress_depth
+
                     m_visits = m.get('visits', 0)
+                    cached_c = self.client.cache.get(c_fen)
+                    if cached_c is not None and cached_c.get('visits', 0) > 0:
+                        m_visits = cached_c.get('visits', 0)
                     m_score = m.get('score')
                     if m_visits > 0 or m_score is not None:
                         if self.skip_zero_cp and m_score == 0:
                             continue
                         if stm == root_stm and effective_min_score is not None and m_score is not None and m_score < effective_min_score:
                             continue
-                        non_cyclic_scored.append((m, c_fen))
+                        # Do not let server-vetoed unsearched claims (< target_score) inflate
+                        # best_non_cyclic and crowd out visited non-cyclic branches; demote them
+                        # to Path 2 unvisited cycle exits instead.
+                        is_vetoed_claim = (
+                            self.strategy == "target"
+                            and m_visits == 0
+                            and m_score is not None
+                            and (self.target_score is None or m_score < self.target_score)
+                            and (m.get('borrowed', False) or (node_score is not None and m_score > node_score))
+                        )
+                        if is_vetoed_claim:
+                            non_cyclic_unvisited.append((m, c_fen, board_copy, cand_np, cand_lpd))
+                        else:
+                            non_cyclic_scored.append((m, c_fen, cand_np, cand_lpd))
                     else:
-                        non_cyclic_unvisited.append((m, c_fen, board_copy))
+                        non_cyclic_unvisited.append((m, c_fen, board_copy, cand_np, cand_lpd))
 
                 # Path 1: Scored non-cyclic moves exist
                 if non_cyclic_scored:
@@ -629,37 +854,42 @@ class MinimaxFrontierExplorer:
                         if self.skip_zero_cp and (stm == root_stm or best_non_cyclic > 0):
                             if effective_min_score is not None:
                                 min_allowed = max(min_allowed, effective_min_score)
-                        valid_candidates = [
-                            (m, c_fen) for m, c_fen in non_cyclic_scored
-                            if m.get('score') is not None and m['score'] >= min_allowed
-                        ]
+                        for m, c_fen, cand_np, cand_lpd in non_cyclic_scored:
+                            if m.get('score') is not None and m['score'] >= min_allowed:
+                                m_copy = dict(m)
+                                if m_copy.get('visits', 0) == 0:
+                                    m_copy['_is_cycle_exit'] = True
+                                valid_candidates.append((m_copy, c_fen, cand_np, cand_lpd))
 
                 # Path 2: No scored non-cyclic moves meet margin, but unanalyzed moves exist (visits == 0).
                 # When all analyzed moves loop, unanalyzed moves are the only way to break the cycle ('cycle_exit')!
                 if not valid_candidates and non_cyclic_unvisited:
                     def unvisited_priority(item):
-                        m_cand, _c_fen, _b_copy = item
+                        m_cand, _c_fen, _b_copy, _np, _lpd = item
+                        m_cand_score = m_cand.get('score')
+                        has_score = 1 if m_cand_score is not None else 0
+                        score_val = m_cand_score if m_cand_score is not None else -99999
                         try:
                             move_obj = chess.Move.from_uci(m_cand['uci'])
                             is_cap = board.is_capture(move_obj)
                             gives_chk = board.gives_check(move_obj)
                             piece = board.piece_at(move_obj.from_square)
                             is_pawn = piece and piece.piece_type == chess.PAWN
-                            return (1 if is_cap else 0, 1 if gives_chk else 0, 1 if is_pawn else 0)
+                            return (has_score, score_val, 1 if is_cap else 0, 1 if gives_chk else 0, 1 if is_pawn else 0)
                         except Exception:
-                            return (0, 0, 0)
+                            return (has_score, score_val, 0, 0, 0)
 
                     non_cyclic_unvisited.sort(key=unvisited_priority, reverse=True)
                     # Queue up to 5 unanalyzed exit moves as leaf candidates
                     max_exits = 5 if (self.max_leaves == 0 or self.max_leaves > 5) else self.max_leaves
-                    for m, c_fen, _ in non_cyclic_unvisited[:max_exits]:
+                    for m, c_fen, _, cand_np, cand_lpd in non_cyclic_unvisited[:max_exits]:
                         m_copy = dict(m)
                         m_copy['_is_cycle_exit'] = True
-                        valid_candidates.append((m_copy, c_fen))
+                        valid_candidates.append((m_copy, c_fen, cand_np, cand_lpd))
 
                     if valid_candidates:
                         logger.info(
-                            f"Repetition at depth {depth} ({fen[:30]}...): "
+                            f"Repetition at depth {depth}: "
                             f"{len(valid_candidates)} unanalyzed exit moves ('cycle_exit') selected as leaf candidates."
                         )
                     else:
@@ -667,7 +897,7 @@ class MinimaxFrontierExplorer:
                             f"Repetition at depth {depth}: Attacker has no non-cyclic exits left -> branch discarded."
                         )
 
-            for m, child_fen in valid_candidates:
+            for m, child_fen, new_no_progress, new_last_prog_depth in valid_candidates:
                 uci = m['uci']
                 move_visits = m.get('visits', 0)
                 cached_child = self.client.cache.get(child_fen)
@@ -683,7 +913,8 @@ class MinimaxFrontierExplorer:
                 is_borrowed = bool(m.get('borrowed', False))
 
                 # 0 cp and min-score check for follow-up moves
-                child_is_pv = is_pv and (best_move is not None and uci == best_move)
+                is_primary_pv = m.get('_is_preferred_pv', False) or (best_move is not None and uci == best_move)
+                child_is_pv = is_pv and is_primary_pv
                 if not child_is_pv:
                     if self.skip_zero_cp and move_score is not None and move_score == 0:
                         continue
@@ -692,11 +923,11 @@ class MinimaxFrontierExplorer:
 
                 # Branch priority calculation (Best-First / depth-first along PV):
                 # 1. Deeper nodes first (factor -new_depth * 1000.0) -> advances to PV head immediately
-                # 2. Prefer engine's official best move (best_move)
+                # 2. Prefer engine's official best move (or progress-preferred tie)
                 # 3. Prefer PV line (-10000.0 bonus)
                 # 4. Prefer moves with higher visit count
                 # 5. Prefer higher minimax scores
-                bm_bonus = -200.0 if (best_move and uci == best_move) else 0.0
+                bm_bonus = -200.0 if is_primary_pv else 0.0
                 pv_bonus = -10000.0 if child_is_pv else 0.0
                 visit_bonus = -min(move_visits, 50) * 2.0
                 score_bonus = -move_score / 10.0 if move_score is not None else 0.0
@@ -714,18 +945,23 @@ class MinimaxFrontierExplorer:
                             continue
 
                         # 2. Attacker (stm == root_stm) made the move to this leaf: White score is move_score.
-                        # Bottleneck search: We only prune leaves that already achieve target if they are NOT borrowed.
-                        # If borrowed, the server vetoes the unsearched claim (quality=0), so it MUST be searched
-                        # to lift the parent/root score to the target!
-                        if stm == root_stm and not is_borrowed and move_score >= self.target_score:
+                        # Only prune a move that meets target if this parent node already accepts >= target_score
+                        # in its own score; otherwise the server vetoed the unsearched claim (borrowed or walked
+                        # with quality=0), so it MUST be searched to lift the parent/root score to the target!
+                        if (
+                            stm == root_stm
+                            and node_score is not None
+                            and node_score >= self.target_score
+                            and move_score >= self.target_score
+                        ):
                             continue
 
                     if child_fen not in seen_leaves:
                         seen_leaves.add(child_fen)
-                        if is_borrowed:
-                            reason_str = 'borrowed_top_move' if (best_move and uci == best_move) else 'borrowed_value'
-                        elif m.get('_is_cycle_exit'):
+                        if m.get('_is_cycle_exit'):
                             reason_str = 'cycle_exit'
+                        elif is_borrowed:
+                            reason_str = 'borrowed_top_move' if (best_move and uci == best_move) else 'borrowed_value'
                         else:
                             reason_str = 'child_zero_visits'
                         leaf = LeafCandidate(
@@ -741,91 +977,278 @@ class MinimaxFrontierExplorer:
                         if on_leaf:
                             on_leaf(leaf)
                 else:
-                    heappush(frontier, (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv))
+                    heappush(
+                        frontier,
+                        (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv, new_no_progress, new_last_prog_depth)
+                    )
 
-        # Cycle Trap Recovery (Cycle-Exit Recovery):
-        # If minimax search found no open leaves because all active branches
-        # starved in closed repetition cycles:
-        # Extract unanalyzed exit moves ('cycle_exit') from attacker cycle nodes
-        # to actively break the cycle in the database!
-        if not leaves and cycle_attacker_events:
-            cycle_attacker_events.sort(key=lambda item: item[0], reverse=True)
-            max_recovery = 5 if (self.max_leaves == 0 or self.max_leaves > 5) else self.max_leaves
+        return leaves, effective_min_score, min_score_initialized
 
-            candidate_exits = []
-            seen_cand_fens = set()
-            for att_depth, att_path in cycle_attacker_events:
-                if len(candidate_exits) >= max_recovery * 3:
-                    break
+    def _recover_no_progress_branches(
+        self,
+        root_fen: str,
+        root_stm: str,
+        effective_min_score: Optional[int],
+        seen_leaves: Set[str],
+        visited_nodes: Set[str],
+        no_progress_events: List[Tuple[int, int, List[str], bool]],
+        on_leaf: Optional[Callable[[LeafCandidate], None]] = None,
+        max_leaves_remaining: int = 0
+    ) -> List[LeafCandidate]:
+        """
+        Recovers from 50-move shuffling traps by inspecting attacker nodes from the start
+        of the non-progress stretch (earliest ply first). Queues unanalyzed progress moves
+        ('progress_exit') and deepens promising already-visited alternative branches so the
+        database prefers a real-progress continuation over an endless shuffle.
+        """
+        unique_att_nodes: Dict[Tuple[str, ...], Tuple[int, int, List[str], bool]] = {}
+        shuffling_ucis_by_prefix: Dict[Tuple[str, ...], Set[str]] = {}
+
+        for _ev_depth, last_prog_depth, ev_path, is_pv_ev in no_progress_events:
+            start_d = last_prog_depth if last_prog_depth % 2 == 0 else (last_prog_depth + 1)
+            end_d = len(ev_path) + (1 if len(ev_path) % 2 == 0 else 0)
+            for d in range(start_d, end_d, 2):
+                prefix = tuple(ev_path[:d])
+                if d < len(ev_path):
+                    shuffling_ucis_by_prefix.setdefault(prefix, set()).add(ev_path[d])
+                prev = unique_att_nodes.get(prefix)
+                if prev is None:
+                    unique_att_nodes[prefix] = (d, last_prog_depth, ev_path[:d], is_pv_ev)
+                elif is_pv_ev and not prev[3]:
+                    unique_att_nodes[prefix] = (prev[0], prev[1], prev[2], True)
+
+        sorted_att_nodes = sorted(
+            unique_att_nodes.values(),
+            key=lambda item: (0 if item[3] else 1, item[0])
+        )
+
+        candidates = []
+        seen_cand_fens: Set[str] = set()
+        for att_depth, last_prog_depth, att_path, is_pv_ev in sorted_att_nodes:
+            if self.max_queries > 0 and self.client.query_count >= self.max_queries:
+                break
+
+            try:
+                b_att = chess.variant.AtomicBoard(root_fen)
+                att_path_fens: Set[str] = {root_fen}
+                for m_str in att_path:
+                    b_att.push_uci(m_str)
+                    att_path_fens.add(canonicalize_fen(b_att.fen()))
+                att_fen = canonicalize_fen(b_att.fen())
+            except Exception:
+                continue
+
+            att_data = self.client.query(att_fen)
+            if not att_data:
+                continue
+
+            att_node_score = att_data.get('score')
+            shuffling_ucis = shuffling_ucis_by_prefix.get(tuple(att_path), set())
+            no_prog_at_att = max(0, att_depth - last_prog_depth)
+
+            for m in att_data.get('moves', []):
+                uci = m.get('uci')
+                if not uci or m.get('floor', False) or m.get('status') not in ('UNKNOWN', None):
+                    continue
+                if uci in shuffling_ucis:
+                    continue
+
+                m_score = m.get('score')
+                if self.skip_zero_cp and m_score is not None and m_score == 0:
+                    continue
+                if effective_min_score is not None and m_score is not None and m_score < effective_min_score:
+                    continue
+
                 try:
-                    b_att = chess.variant.AtomicBoard(root_fen)
-                    for m_str in att_path:
-                        b_att.push_uci(m_str)
-                    att_fen = canonicalize_fen(b_att.fen())
+                    move_obj = chess.Move.from_uci(uci)
+                    is_prog = is_progress_move(b_att, move_obj)
+                    next_no_prog = 0 if is_prog else (no_prog_at_att + 1)
+                    if self.max_no_progress > 0 and next_no_prog >= self.max_no_progress:
+                        continue
+                    b_cand = b_att.copy()
+                    b_cand.push(move_obj)
+                    cand_fen = canonicalize_fen(b_cand.fen())
                 except Exception:
                     continue
 
-                att_data = self.client.query(att_fen)
-                if not att_data:
+                if cand_fen in att_path_fens or cand_fen in seen_cand_fens:
                     continue
 
-                for m in att_data.get('moves', []):
-                    uci = m.get('uci')
-                    if not uci or m.get('floor', False) or m.get('status') not in ('UNKNOWN', None):
-                        continue
-                    if m.get('visits', 0) > 0:
-                        continue
-                    m_score = m.get('score')
-                    if self.skip_zero_cp and m_score is not None and m_score == 0:
-                        continue
+                m_visits = m.get('visits', 0)
+                cached_child = self.client.cache.get(cand_fen)
+                if cached_child is not None and cached_child.get('visits', 0) > 0:
+                    m_visits = cached_child.get('visits', 0)
 
-                    try:
-                        b_cand = b_att.copy()
-                        move_obj = chess.Move.from_uci(uci)
-                        is_cap = b_att.is_capture(move_obj)
-                        gives_chk = b_att.gives_check(move_obj)
-                        piece = b_att.piece_at(move_obj.from_square)
-                        is_pawn = piece and piece.piece_type == chess.PAWN
-                        b_cand.push_uci(uci)
-                        cand_fen = canonicalize_fen(b_cand.fen())
-                    except Exception:
+                if m_visits == 0:
+                    if cand_fen in seen_leaves or cand_fen in self.known_analyzed_fens:
+                        continue
+                else:
+                    if cand_fen in visited_nodes or cand_fen in seen_leaves:
                         continue
 
-                    if cand_fen in seen_leaves or cand_fen in seen_cand_fens or cand_fen in self.known_analyzed_fens:
-                        continue
-                    seen_cand_fens.add(cand_fen)
+                seen_cand_fens.add(cand_fen)
+                m_backed = m.get('backed_plies', 0)
+                within_tol = (
+                    (m_visits == 0)
+                    or (m_score is None)
+                    or (att_node_score is None)
+                    or (m_score >= att_node_score - 100)
+                )
+                not_shuffler = (self.max_no_progress == 0 or m_backed < self.max_no_progress)
 
-                    prio_score = m_score if m_score is not None else -9999
-                    prio_tuple = (prio_score, 1 if is_cap else 0, 1 if gives_chk else 0, 1 if is_pawn else 0)
-                    candidate_exits.append((prio_tuple, att_depth + 1, att_path + [uci], cand_fen, m, att_fen))
+                if is_prog and within_tol:
+                    tier = 1
+                elif (not is_prog) and within_tol and (m_visits == 0 or not_shuffler):
+                    tier = 2
+                elif is_prog:
+                    tier = 3
+                else:
+                    continue
 
-            if candidate_exits:
-                candidate_exits.sort(key=lambda x: x[0], reverse=True)
-                for _, depth_val, path_val, cand_fen, m_dict, parent_fen_val in candidate_exits[:max_recovery]:
-                    if cand_fen not in seen_leaves:
-                        seen_leaves.add(cand_fen)
-                        leaf = LeafCandidate(
-                            fen=cand_fen,
-                            path=path_val,
-                            depth=depth_val,
-                            score=m_dict.get('score'),
-                            reason='cycle_exit',
-                            parent_fen=parent_fen_val,
-                            priority=-depth_val * 1000.0
-                        )
-                        leaves.append(leaf)
-                        if on_leaf:
-                            on_leaf(leaf)
+                is_cap = 1 if b_att.is_capture(move_obj) else 0
+                gives_chk = 1 if b_att.gives_check(move_obj) else 0
+                piece = b_att.piece_at(move_obj.from_square)
+                is_pawn = 1 if (piece is not None and piece.piece_type == chess.PAWN) else 0
+                score_rank = m_score if m_score is not None else -99999
 
-                if leaves:
+                sort_key = (
+                    tier,
+                    0 if is_pv_ev else 1,
+                    att_depth,
+                    0 if m_visits == 0 else 1,
+                    -score_rank,
+                    -is_cap,
+                    -gives_chk,
+                    -is_pawn
+                )
+                candidates.append((
+                    sort_key, tier, att_depth, last_prog_depth,
+                    att_path, att_path_fens, att_fen, m, cand_fen, m_visits, is_prog
+                ))
+
+        candidates.sort(key=lambda item: item[0])
+
+        max_recovery = 5 if (self.max_leaves == 0 or self.max_leaves > 5) else self.max_leaves
+        if max_leaves_remaining > 0:
+            max_recovery = min(max_recovery, max_leaves_remaining)
+
+        recovered: List[LeafCandidate] = []
+        unvisited_anchor: Optional[Tuple[int, int]] = None
+
+        for _sk, tier, att_depth, last_prog_depth, att_path, att_path_fens, att_fen, m_dict, cand_fen, m_visits, is_prog in candidates:
+            if max_leaves_remaining > 0 and len(recovered) >= max_leaves_remaining:
+                break
+
+            uci = m_dict['uci']
+            if m_visits == 0:
+                if unvisited_anchor is not None and (tier, att_depth) != unvisited_anchor:
+                    break
+                if len(recovered) >= max_recovery:
+                    break
+                if cand_fen in seen_leaves:
+                    continue
+                unvisited_anchor = (tier, att_depth)
+                seen_leaves.add(cand_fen)
+                leaf = LeafCandidate(
+                    fen=cand_fen,
+                    path=att_path + [uci],
+                    depth=att_depth + 1,
+                    score=m_dict.get('score'),
+                    reason='progress_exit',
+                    parent_fen=att_fen,
+                    priority=-(att_depth + 1) * 1000.0
+                )
+                recovered.append(leaf)
+                if on_leaf:
+                    on_leaf(leaf)
+            else:
+                if recovered:
+                    break
+                if self.max_queries > 0 and self.client.query_count >= self.max_queries:
+                    break
+
+                no_prog_at_att = max(0, att_depth - last_prog_depth)
+                next_no_prog = 0 if is_prog else (no_prog_at_att + 1)
+                next_last_prog = (att_depth + 1) if is_prog else last_prog_depth
+                sub_initial = [(
+                    -10000.0 - (att_depth + 1) * 1000.0,
+                    att_depth + 1,
+                    att_path + [uci],
+                    att_path_fens | {cand_fen},
+                    cand_fen,
+                    True,
+                    next_no_prog,
+                    next_last_prog
+                )]
+                rem = (max_leaves_remaining - len(recovered)) if max_leaves_remaining > 0 else 0
+                sub_leaves, _, _ = self._traverse_frontier(
+                    initial_nodes=sub_initial,
+                    root_stm=root_stm,
+                    effective_min_score=effective_min_score,
+                    min_score_initialized=True,
+                    seen_leaves=seen_leaves,
+                    visited_nodes=visited_nodes,
+                    cycle_attacker_events=[],
+                    no_progress_events=[],
+                    on_leaf=on_leaf,
+                    max_leaves_limit=rem
+                )
+                if sub_leaves:
+                    recovered.extend(sub_leaves)
                     logger.info(
-                        f"Cycle trap resolved: {len(leaves)} unanalyzed exit moves ('cycle_exit') "
-                        f"found at depth {leaves[0].depth} to break repetition."
+                        f"50-move recovery: deepening alternative '{uci}' at ply {att_depth} "
+                        f"(score {m_dict.get('score')} cp, Tier {tier}) yielded {len(sub_leaves)} leaf/leaves."
                     )
+                    break
 
-        # Sort leaves: most important and deepest along main variation first
-        leaves.sort(key=lambda l: l.priority)
-        return leaves
+        if recovered and unvisited_anchor is not None:
+            logger.info(
+                f"50-move recovery: queued {len(recovered)} unanalyzed exit move(s) ('progress_exit', "
+                f"Tier {unvisited_anchor[0]}) at ply {unvisited_anchor[1]} to build progress path."
+            )
+
+        return recovered
+
+    def _prefer_progress_attacker_move(
+        self,
+        anchor: dict,
+        candidates: List[dict],
+        board: Optional[chess.variant.AtomicBoard],
+    ) -> dict:
+        """
+        If `anchor` (typically DB best_move) does not reset the 50-move rule while one or more
+        equal-score UNKNOWN candidates do, returns the best-supported progress candidate instead.
+        """
+        if board is None or len(candidates) <= 1:
+            return anchor
+
+        def _is_prog(m: dict) -> bool:
+            uci = m.get('uci')
+            if not uci:
+                return False
+            try:
+                return is_progress_move(board, chess.Move.from_uci(uci))
+            except Exception:
+                return False
+
+        if _is_prog(anchor):
+            return anchor
+
+        progress_ties = [m for m in candidates if m.get('uci') != anchor.get('uci') and _is_prog(m)]
+        if not progress_ties:
+            return anchor
+
+        progress_ties.sort(
+            key=lambda m: (
+                1 if m.get('visits', 0) > 0 else 0,
+                1 if not m.get('borrowed', False) else 0,
+                min(m.get('visits', 0), 1000),
+            ),
+            reverse=True,
+        )
+        chosen = dict(progress_ties[0])
+        chosen['_is_preferred_pv'] = True
+        return chosen
 
     def _select_moves(
         self,
@@ -835,7 +1258,8 @@ class MinimaxFrontierExplorer:
         root_stm: str = 'w',
         node_score: Optional[int] = None,
         effective_min_score: Optional[int] = None,
-        is_pv: bool = False
+        is_pv: bool = False,
+        board: Optional[chess.variant.AtomicBoard] = None
     ) -> List[dict]:
         """Selects moves relevant for minimax/solving based on strategy."""
         scored_moves = [
@@ -867,32 +1291,69 @@ class MinimaxFrontierExplorer:
 
             if stm == root_stm:
                 # Attacker (White / OR node): White chooses its attack freely and strictly plays its
-                # single best move (max score). White never branches into inferior moves.
-                # PV GUARANTEE: If on the PV, strictly follow best_move to stay on the main line.
+                # single best move (max score), preferring a 50-move-resetting move when equal-score moves tie.
                 if is_pv and best_move:
                     bm_m = next((m for m in scored_moves if m['uci'] == best_move and m.get('status') == 'UNKNOWN'), None)
-                    if not bm_m:
+                    if bm_m:
+                        tie_pool = [
+                            m for m in scored_moves
+                            if m['score'] == bm_m['score'] and m.get('status') == 'UNKNOWN'
+                        ]
+                        selected = [self._prefer_progress_attacker_move(bm_m, tie_pool, board)]
+                    else:
                         bm_m = next((m for m in moves if m['uci'] == best_move), None)
-                    selected = [bm_m] if bm_m else []
+                        selected = [bm_m] if bm_m else []
                 else:
                     best_candidates = [
                         m for m in scored_moves
                         if m['score'] == best_score and m.get('status') == 'UNKNOWN'
                     ]
-                    if not best_candidates and best_move:
-                        best_candidates = [m for m in scored_moves if m['uci'] == best_move]
-                    if len(best_candidates) > 1 and best_move:
-                        bm_filtered = [m for m in best_candidates if m['uci'] == best_move]
-                        selected = bm_filtered if bm_filtered else best_candidates[:1]
+                    if best_candidates:
+                        anchor = None
+                        if best_move:
+                            anchor = next((m for m in best_candidates if m['uci'] == best_move), None)
+                        if anchor is None:
+                            anchor = best_candidates[0]
+                        selected = [self._prefer_progress_attacker_move(anchor, best_candidates, board)]
+                    elif best_move:
+                        selected = [m for m in scored_moves if m['uci'] == best_move][:1]
                     else:
-                        selected = best_candidates[:1]
+                        selected = []
+
+                # Direct record shortcut against server Claim-Veto (ingest._backed_for):
+                # If this attacker node is still below target, an unsearched non-floor move
+                # (borrowed transposition seed or walked line with quality == 0) whose score
+                # already meets target (or exceeds node_score in breaker passes) was vetoed
+                # by the server only because visits == 0. Include it so we lift the node!
+                if node_score is None or node_score < target:
+                    selected_ucis = {m.get('uci') for m in selected if m}
+                    min_shortcut = (node_score + 1) if (node_score is not None and self.margin_cp > 0) else target
+                    vetoed_shortcuts = [
+                        m for m in scored_moves
+                        if m.get('status') == 'UNKNOWN'
+                        and m.get('visits', 0) == 0
+                        and m.get('uci') not in selected_ucis
+                        and m['score'] >= min_shortcut
+                    ]
+                    if vetoed_shortcuts:
+                        vetoed_shortcuts.sort(key=lambda m: m['score'], reverse=True)
+                        selected.extend(vetoed_shortcuts)
             else:
                 # Defender (Black / AND node):
                 # Follow candidate defenses that hold White below target (m['score'] > -target - margin_tol).
                 # Moves with m['score'] <= -target - margin_tol are pruned as secured for White.
+                # Skip vetoed foreign borrowed claims (> node_score when not best_move), because
+                # the server ignores them in favor of real searched moves holding node_score.
                 candidates = [
                     m for m in scored_moves
-                    if m.get('status') == 'UNKNOWN' and m['score'] > -target - margin_tol
+                    if m.get('status') == 'UNKNOWN'
+                    and m['score'] > -target - margin_tol
+                    and not (
+                        m.get('borrowed', False)
+                        and m.get('uci') != best_move
+                        and node_score is not None
+                        and m['score'] > node_score
+                    )
                 ]
                 # PV GUARANTEE: If this node is on the PV, Black's best_move is ALWAYS followed,
                 # even if its score in the DB is <= -target due to server backprop lag!
@@ -907,7 +1368,7 @@ class MinimaxFrontierExplorer:
                 if not candidates:
                     return []
 
-                candidates.sort(key=lambda m: m['score'], reverse=True)
+                candidates.sort(key=lambda m: (m['score'], 0 if m.get('borrowed', False) else 1), reverse=True)
                 def_branch = self.defender_branching if self.defender_branching > 0 else len(candidates)
                 selected = candidates[:def_branch]
                 if is_pv and bm_m and bm_m not in selected:
@@ -968,7 +1429,8 @@ class MinimaxFrontierExplorer:
 
         if best_move and len(selected) > 1:
             selected.sort(key=lambda m: (
-                m.get('uci') != best_move,
+                not m.get('_is_preferred_pv', False) and m.get('uci') != best_move,
+                0 if m.get('_is_preferred_pv', False) else 1,
                 -(m.get('score') if m.get('score') is not None else -99999)
             ))
 
@@ -1128,37 +1590,47 @@ def run_cycle(
         if explorer.strategy == "target" and explorer.target_score is not None:
             orig_margin = explorer.margin_cp
             orig_branching = explorer.defender_branching
-            breaker_margin = 10
-            breaker_branching = 2
-            logger.info(
-                f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
-                f"Trying margin: {breaker_margin} cp (def-branch: {breaker_branching})..."
-            )
+            breaker_branching = max(2, orig_branching)
+            # If regular pass ran with defender_branching < 2, first try defender_branching = 2
+            # with margin 0 cp before escalating the margin tolerance.
+            start_margin = 0 if orig_branching < breaker_branching else max(1, orig_margin + 1)
             try:
-                explorer.margin_cp = breaker_margin
                 explorer.defender_branching = breaker_branching
-                client.query_count = 0
-                queued_before_breaker = queued_count
-                analyzed_before_breaker = already_analyzed_count
-                breaker_leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
-                print("=" * 78)
-                breaker_queued = queued_count - queued_before_breaker
-                breaker_analyzed = already_analyzed_count - analyzed_before_breaker
-
-                if not breaker_leaves or breaker_queued == 0:
-                    if not breaker_leaves:
-                        logger.info("[BREAKER] No open leaf nodes found in breaker pass either.")
-                    else:
-                        logger.info(f"[BREAKER] No leaves queued in breaker pass either ({len(breaker_leaves)} found, 0 queued).")
-                else:
-                    extra_info = [f"{breaker_queued} queued"]
-                    if breaker_analyzed > 0:
-                        extra_info.append(f"{breaker_analyzed} already analyzed")
-                    summary_str = ", ".join(extra_info)
+                for breaker_margin in range(start_margin, 11):
                     logger.info(
-                        f"[BREAKER] Traversal complete: {len(breaker_leaves)} leaves found, "
-                        f"{summary_str} ({client.query_count} queries)."
+                        f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
+                        f"Trying margin: {breaker_margin} cp (def-branch: {breaker_branching})..."
                     )
+                    explorer.margin_cp = breaker_margin
+                    client.query_count = 0
+                    queued_before_breaker = queued_count
+                    analyzed_before_breaker = already_analyzed_count
+                    breaker_leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
+                    print("=" * 78)
+                    breaker_queued = queued_count - queued_before_breaker
+                    breaker_analyzed = already_analyzed_count - analyzed_before_breaker
+
+                    if breaker_queued > 0:
+                        extra_info = [f"{breaker_queued} queued"]
+                        if breaker_analyzed > 0:
+                            extra_info.append(f"{breaker_analyzed} already analyzed")
+                        summary_str = ", ".join(extra_info)
+                        logger.info(
+                            f"[BREAKER] Traversal complete: {len(breaker_leaves)} leaves found, "
+                            f"{summary_str} ({client.query_count} queries at margin {breaker_margin} cp, def-branch: {breaker_branching})."
+                        )
+                        break
+                    else:
+                        if not breaker_leaves:
+                            logger.info(f"[BREAKER] No open leaf nodes found (margin: {breaker_margin} cp, def-branch: {breaker_branching}).")
+                        else:
+                            logger.info(
+                                f"[BREAKER] No leaves queued ({len(breaker_leaves)} found, 0 queued at margin {breaker_margin} cp, def-branch: {breaker_branching})."
+                            )
+                        if breaker_margin < 10:
+                            logger.info(f"[BREAKER] Escalating margin from {breaker_margin} cp to {breaker_margin + 1} cp...")
+                        else:
+                            logger.info("[BREAKER] No open leaf nodes found up to margin 10 cp.")
             finally:
                 explorer.margin_cp = orig_margin
                 explorer.defender_branching = orig_branching
@@ -1421,6 +1893,12 @@ def parse_arguments():
         help="Max candidate moves for the opponent/defender to explore at each node (default: 2; 0 = unlimited)"
     )
     parser.add_argument("--max-depth", type=int, default=0, help="Max search depth in plies (0 = unlimited, default: 0)")
+    parser.add_argument(
+        "--max-no-progress",
+        type=int,
+        default=100,
+        help="Max plies without capture or pawn move before treating as a 50-move draw and building progress paths (0 = disabled, default: 100)"
+    )
     parser.add_argument("--max-leaves", type=int, default=0, help="Max leaves per cycle (0 = all discovered, default: 0)")
     parser.add_argument("--max-queries", type=int, default=0, help="Max API queries per cycle (0 = unlimited, default: 0)")
     parser.add_argument(
@@ -1581,11 +2059,12 @@ def main():
     if args.moves:
         print(f" Moves      : {args.moves}")
     depth_str = "Unlimited" if args.max_depth == 0 else f"{args.max_depth} plies"
+    no_prog_str = "Disabled" if args.max_no_progress == 0 else f"{args.max_no_progress} plies"
     leaves_str = "All discovered" if args.max_leaves == 0 else str(args.max_leaves)
     branching_str = "Unlimited" if eff_defender_branching == 0 else str(eff_defender_branching)
     if args.strategy in ("target", "and_or"):
         print(f" Defender Br: {branching_str} max defensive tries per AND node")
-    print(f" Max Depth  : {depth_str} | Max Leaves: {leaves_str}")
+    print(f" Max Depth  : {depth_str} | No-Progress: {no_prog_str} | Max Leaves: {leaves_str}")
     print(f" 0 cp Filter: {'Active (skip 0 cp / draw)' if args.skip_zero_cp else 'Inactive'} | Min Score: {min_score_display}")
     print(f" Budget     : {b_label}")
     print(f" Mode       : {args.mode.upper()}" + (f" (polling: every {args.poll_interval}s)" if args.mode == "loop" else ""))
@@ -1604,7 +2083,8 @@ def main():
         max_leaves=args.max_leaves,
         max_queries=args.max_queries,
         skip_zero_cp=args.skip_zero_cp,
-        min_score=args.min_score
+        min_score=args.min_score,
+        max_no_progress=args.max_no_progress
     )
 
     if args.strategy == "target" and target_score is not None:
