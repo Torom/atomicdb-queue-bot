@@ -24,7 +24,6 @@ import hashlib
 import logging
 import os
 import sys
-import textwrap
 import time
 from dataclasses import dataclass
 from heapq import heappop, heappush
@@ -114,17 +113,107 @@ def move_tactical_priority(board: chess.Board, move: chess.Move) -> Tuple[int, i
     )
 
 
-def resolve_root_fen(base_fen: str, moves_str: Optional[str] = None) -> str:
-    """
-    Computes the resulting root FEN by playing moves_str (UCI or SAN)
-    starting from base_fen.
-    """
-    board = chess.variant.AtomicBoard(base_fen)
-    if not moves_str:
-        return canonicalize_fen(board.fen())
+def move_to_san(board: chess.Board, uci: Optional[str]) -> str:
+    """Converts a UCI move to SAN on `board`, falling back to `uci` or '?'."""
+    if not uci:
+        return "?"
+    try:
+        return board.san(board.parse_uci(uci))
+    except Exception:
+        return uci
 
-    tokens = moves_str.replace(",", " ").split()
-    for token in tokens:
+
+def format_path_san(root_fen: str, path: List[str]) -> str:
+    """Formats a UCI move sequence starting at `root_fen` as numbered SAN."""
+    if not path:
+        return "(Root)"
+    try:
+        board = chess.variant.AtomicBoard(root_fen)
+        return board.variation_san([chess.Move.from_uci(uci) for uci in path])
+    except Exception:
+        return " ".join(path)
+
+
+def wrap_san_path(path_str: str, width: int = 120, indent_len: int = 11, max_cols: int = 7) -> List[str]:
+    """
+    Formats a SAN variation into aligned full-move columns (`max_cols` per line)
+    so move numbers line up vertically across lines without splitting White/Black moves.
+    """
+    tokens = path_str.split()
+    if not tokens:
+        return [path_str]
+
+    if not any(tok.endswith(".") or "..." in tok for tok in tokens):
+        # Unnumbered fallback (e.g. raw UCI mock paths)
+        lines: List[str] = []
+        cur = ""
+        for tok in tokens:
+            cur_cand = tok if not cur else f"{cur} {tok}"
+            if len(cur_cand) <= width - indent_len:
+                cur = cur_cand
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = tok
+        if cur:
+            lines.append(cur)
+        return lines or [path_str]
+
+    cells: List[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i].endswith("."):
+            if (
+                i + 2 < len(tokens)
+                and not tokens[i + 2].endswith(".")
+                and "..." not in tokens[i + 2]
+            ):
+                cells.append(f"{tokens[i]} {tokens[i + 1]} {tokens[i + 2]}")
+                i += 3
+            elif i + 1 < len(tokens):
+                cells.append(f"{tokens[i]} {tokens[i + 1]}")
+                i += 2
+            else:
+                cells.append(tokens[i])
+                i += 1
+        else:
+            cells.append(tokens[i])
+            i += 1
+
+    if len(cells) <= max_cols and len(" ".join(cells)) <= width - indent_len:
+        return [" ".join(cells)]
+
+    chosen_cols = 1
+    chosen_widths = [max(len(c) for c in cells)]
+    for cols in range(min(max_cols, len(cells)), 0, -1):
+        rows = [cells[r:r + cols] for r in range(0, len(cells), cols)]
+        widths = [
+            max((len(row[c]) for row in rows if c < len(row)), default=0)
+            for c in range(cols)
+        ]
+        if indent_len + sum(widths) + 2 * (cols - 1) <= width:
+            chosen_cols = cols
+            chosen_widths = widths
+            break
+
+    rows = [cells[r:r + chosen_cols] for r in range(0, len(cells), chosen_cols)]
+    return [
+        "  ".join(
+            cell.ljust(chosen_widths[c]) if c < len(row) - 1 else cell
+            for c, cell in enumerate(row)
+        )
+        for row in rows
+    ]
+
+
+def _parse_move_sequence(base_fen: str, moves_str: Optional[str] = None) -> Tuple[chess.variant.AtomicBoard, List[chess.Move]]:
+    """Plays `moves_str` (UCI or SAN) from `base_fen` and returns (end_board, move_list)."""
+    board = chess.variant.AtomicBoard(base_fen)
+    parsed_moves: List[chess.Move] = []
+    if not moves_str:
+        return board, parsed_moves
+
+    for token in moves_str.replace(",", " ").split():
         cleaned = token.rstrip(".").strip()
         if not cleaned or cleaned.isdigit():
             continue
@@ -141,8 +230,18 @@ def resolve_root_fen(base_fen: str, moves_str: Optional[str] = None) -> str:
             except ValueError as e:
                 raise ValueError(f"Could not parse move '{token}' from sequence '{moves_str}': {e}")
 
+        parsed_moves.append(move_obj)
         board.push(move_obj)
 
+    return board, parsed_moves
+
+
+def resolve_root_fen(base_fen: str, moves_str: Optional[str] = None) -> str:
+    """
+    Computes the resulting root FEN by playing moves_str (UCI or SAN)
+    starting from base_fen.
+    """
+    board, _ = _parse_move_sequence(base_fen, moves_str)
     return canonicalize_fen(board.fen())
 
 
@@ -729,12 +828,14 @@ class MinimaxFrontierExplorer:
 
             for sm in selected_moves:
                 if sm.get('_is_preferred_pv') and best_move and sm.get('uci') != best_move:
+                    sm_san = move_to_san(board, sm.get('uci'))
+                    bm_san = move_to_san(board, best_move)
                     logger.info(
-                        f"Preferring 50-move progress move '{sm.get('uci')}' over non-progress "
-                        f"best_move '{best_move}' at depth {depth} (score {sm.get('score'):+d} cp)."
+                        f"Preferring 50-move progress move '{sm_san}' over non-progress "
+                        f"best_move '{bm_san}' at depth {depth} (score {sm.get('score'):+d} cp)."
                         if sm.get('score') is not None else
-                        f"Preferring 50-move progress move '{sm.get('uci')}' over non-progress "
-                        f"best_move '{best_move}' at depth {depth}."
+                        f"Preferring 50-move progress move '{sm_san}' over non-progress "
+                        f"best_move '{bm_san}' at depth {depth}."
                     )
                     break
 
@@ -748,14 +849,15 @@ class MinimaxFrontierExplorer:
                 try:
                     move_obj = chess.Move.from_uci(uci)
                     is_prog = board.is_zeroing(move_obj)
+                    move_san = board.san(move_obj)
                     child_fen = push_move_fen(board, move_obj)
                 except Exception as ex:
-                    logger.warning(f"Could not execute move {uci} on {fen}: {ex}")
+                    logger.warning(f"Could not execute move {move_to_san(board, uci)} on {fen}: {ex}")
                     continue
 
                 if child_fen in path_fens:
                     repeated_fens.append(child_fen)
-                    logger.debug(f"Move {uci} leads to repetition (position already on path).")
+                    logger.debug(f"Move {move_san} leads to repetition (position already on path).")
                     continue
 
                 new_no_progress = 0 if is_prog else (no_progress_plies + 1)
@@ -793,7 +895,7 @@ class MinimaxFrontierExplorer:
                     # Defender forces a draw by repetition (0 cp).
                     # In minimax, a losing defender chooses a draw over losing non-cyclic moves.
                     # This branch ends in a draw and is discarded for the winning-seeking attacker.
-                    moves_str = ", ".join(m.get('uci', '?') for m in selected_moves)
+                    moves_str = ", ".join(move_to_san(board, m.get('uci')) for m in selected_moves)
                     logger.info(
                         f"Repetition at depth {depth}: Defender forces draw via "
                         f"{moves_str} -> branch discarded."
@@ -1113,7 +1215,7 @@ class MinimaxFrontierExplorer:
                 )
                 candidates.append((
                     sort_key, tier, att_depth, last_prog_depth,
-                    att_path, att_path_fens, att_fen, m, cand_fen, m_visits, is_prog
+                    att_path, att_path_fens, att_fen, m, cand_fen, m_visits, is_prog, b_att.san(move_obj)
                 ))
 
         candidates.sort(key=lambda item: item[0])
@@ -1125,7 +1227,7 @@ class MinimaxFrontierExplorer:
         recovered: List[LeafCandidate] = []
         unvisited_anchor: Optional[Tuple[int, int]] = None
 
-        for _sk, tier, att_depth, last_prog_depth, att_path, att_path_fens, att_fen, m_dict, cand_fen, m_visits, is_prog in candidates:
+        for _sk, tier, att_depth, last_prog_depth, att_path, att_path_fens, att_fen, m_dict, cand_fen, m_visits, is_prog, m_san in candidates:
             if max_leaves_remaining > 0 and len(recovered) >= max_leaves_remaining:
                 break
 
@@ -1186,7 +1288,7 @@ class MinimaxFrontierExplorer:
                 if sub_leaves:
                     recovered.extend(sub_leaves)
                     logger.info(
-                        f"50-move recovery: deepening alternative '{uci}' at ply {att_depth} "
+                        f"50-move recovery: deepening alternative '{m_san}' at ply {att_depth} "
                         f"(score {m_dict.get('score')} cp, Tier {tier}) yielded {len(sub_leaves)} leaf/leaves."
                     )
                     break
@@ -1443,19 +1545,16 @@ def run_cycle(
 
         leaf_idx += 1
         score_str = f"{leaf.score:+d} cp" if leaf.score is not None else "N/A"
-        path_str = " ".join(leaf.path) if leaf.path else "(Root)"
+        path_str = format_path_san(root_fen, leaf.path)
 
         logger.info(
             f"[Leaf #{leaf_idx:02d} found] Depth: {leaf.depth:2d} plies | "
             f"Score: {score_str:>8} | Reason: {leaf.reason}"
         )
-        if len(path_str) > 105:
-            wrapped = textwrap.wrap(path_str, width=105)
-            print(f"     Path: {wrapped[0]}")
-            for p_line in wrapped[1:]:
-                print(f"           {p_line}")
-        else:
-            print(f"     Path: {path_str}")
+        wrapped = wrap_san_path(path_str)
+        print(f"     Path: {wrapped[0]}")
+        for p_line in wrapped[1:]:
+            print(f"           {p_line}")
         print(f"     FEN : {leaf.fen}")
 
         if dry_run:
@@ -2006,6 +2105,10 @@ def main():
     effective_root_fen = resolve_root_fen(args.fen, args.moves)
     root_stm = effective_root_fen.split()[1] if len(effective_root_fen.split()) > 1 else 'w'
     stm_name = "White" if root_stm == 'w' else "Black"
+    moves_san_display = None
+    if args.moves:
+        _, parsed_root_moves = _parse_move_sequence(args.fen, args.moves)
+        moves_san_display = chess.variant.AtomicBoard(args.fen).variation_san(parsed_root_moves)
 
     min_score_display = (
         f"{args.min_score} cp (explicit)" if args.min_score is not None
@@ -2036,8 +2139,11 @@ def main():
     if args.strategy == "target" and target_score is not None:
         print(f" Target     : {target_score:+d} cp ({target_desc})")
     print(f" Root FEN   : {effective_root_fen} ({stm_name} to move)")
-    if args.moves:
-        print(f" Moves      : {args.moves}")
+    if moves_san_display:
+        wrapped_moves = wrap_san_path(moves_san_display, indent_len=14)
+        print(f" Moves      : {wrapped_moves[0]}")
+        for m_line in wrapped_moves[1:]:
+            print(f"              {m_line}")
     depth_str = "Unlimited" if args.max_depth == 0 else f"{args.max_depth} plies"
     no_prog_str = "Disabled" if args.max_no_progress == 0 else f"{args.max_no_progress} plies"
     leaves_str = "All discovered" if args.max_leaves == 0 else str(args.max_leaves)
