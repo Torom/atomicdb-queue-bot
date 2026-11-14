@@ -1529,7 +1529,8 @@ def run_cycle(
     max_queue: int,
     budget: int,
     max_allowed_budget: int,
-    dry_run: bool
+    dry_run: bool,
+    target_arg: str = "auto"
 ) -> List[dict]:
     """
     Executes a single analysis and queuing pass.
@@ -1658,6 +1659,21 @@ def run_cycle(
             try:
                 explorer.defender_branching = breaker_branching
                 for breaker_margin in range(start_margin, 11):
+                    new_target = refresh_target_score(
+                        client=client,
+                        root_fen=root_fen,
+                        target_arg=target_arg,
+                        current_target=explorer.target_score,
+                        banner_pad=True
+                    )
+                    if new_target is not None:
+                        explorer.target_score = new_target
+                        logger.info(
+                            f"[BREAKER] Target updated to {new_target:+d} cp; "
+                            f"aborting breaker pass to restart from margin {orig_margin} cp."
+                        )
+                        break
+
                     logger.info(
                         f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
                         f"Trying margin: {breaker_margin} cp (def-branch: {breaker_branching})..."
@@ -2178,6 +2194,58 @@ def resolve_target_score(
     return target, f"default advantage target: {target:+d} cp", None
 
 
+def refresh_target_score(
+    client: AtomicDBClient,
+    root_fen: str,
+    target_arg: str,
+    current_target: int,
+    banner_pad: bool = False
+) -> Optional[int]:
+    """
+    Re-queries live root score and (in 'auto' mode) /api/roots.
+    If the target was reached or superseded by a higher record, prints a banner
+    and returns the updated target_score; otherwise returns None.
+    """
+    root_data = client.query(root_fen, bypass_cache=True)
+    cur_score = root_data.get('score') if root_data else None
+
+    if cur_score is not None and cur_score >= current_target:
+        if banner_pad:
+            print()
+        print("=" * 80)
+        print(f" 🏆 TARGET ACHIEVED! Root score reached {cur_score:+d} cp (Target was: {current_target:+d} cp) 🏆")
+        print("=" * 80 + ("\n" if banner_pad else ""))
+        new_target, desc, _ = resolve_target_score(
+            client=client,
+            root_fen=root_fen,
+            target_arg=target_arg,
+            min_target=cur_score + 1,
+            curr_score=cur_score
+        )
+        logger.info(f"Advancing to next target: {new_target:+d} cp ({desc})\n")
+        return new_target
+
+    if target_arg.lower() == "auto":
+        fresh_target, fresh_desc, fresh_rec = resolve_target_score(
+            client=client,
+            root_fen=root_fen,
+            target_arg="auto",
+            min_target=current_target,
+            curr_score=cur_score
+        )
+        if fresh_target > current_target:
+            rec_val = fresh_rec.get('best_value') if fresh_rec else (fresh_target - 1)
+            if banner_pad:
+                print()
+            print("=" * 80)
+            print(f" 🏆 NEW RECORD IN /api/roots: {rec_val:+d} cp (Previous target was: {current_target:+d} cp) 🏆")
+            print("=" * 80 + ("\n" if banner_pad else ""))
+            logger.info(f"Advancing to next target: {fresh_target:+d} cp ({fresh_desc})\n")
+            return fresh_target
+
+    return None
+
+
 def _wait_for_existing_user_queue(
     client: AtomicDBClient,
     poll_interval: int,
@@ -2326,7 +2394,8 @@ def main():
                 max_queue=args.max_leaves,
                 budget=target_budget,
                 max_allowed_budget=max_allowed_budget,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                target_arg=args.target_score
             )
         else:
             logger.info("Starting reactive monitoring loop...")
@@ -2343,41 +2412,16 @@ def main():
             while True:
                 try:
                     if explorer.strategy == "target" and target_score is not None:
-                        root_data = client.query(effective_root_fen, bypass_cache=True)
-                        cur_score = root_data.get('score') if root_data else None
-
-                        # 1. Live root score achieved the target:
-                        if cur_score is not None and cur_score >= target_score:
-                            print("\n" + "=" * 80)
-                            print(f" 🏆 TARGET ACHIEVED! Root score reached {cur_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
-                            print("=" * 80 + "\n")
-                            target_score, target_desc, _ = resolve_target_score(
-                                client=client,
-                                root_fen=effective_root_fen,
-                                target_arg=args.target_score,
-                                min_target=cur_score + 1,
-                                curr_score=cur_score
-                            )
-                            explorer.target_score = target_score
-                            logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
-
-                        # 2. In auto mode, check if /api/roots published a new higher record extreme:
-                        elif args.target_score.lower() == "auto":
-                            fresh_target, fresh_desc, fresh_rec = resolve_target_score(
-                                client=client,
-                                root_fen=effective_root_fen,
-                                target_arg="auto",
-                                min_target=target_score,
-                                curr_score=cur_score
-                            )
-                            if fresh_target > target_score:
-                                rec_val = fresh_rec.get('best_value') if fresh_rec else (fresh_target - 1)
-                                print("\n" + "=" * 80)
-                                print(f" 🏆 NEW RECORD IN /api/roots: {rec_val:+d} cp (Previous target was: {target_score:+d} cp) 🏆")
-                                print("=" * 80 + "\n")
-                                target_score = fresh_target
-                                explorer.target_score = target_score
-                                logger.info(f"Advancing to next target: {target_score:+d} cp ({fresh_desc})\n")
+                        new_target = refresh_target_score(
+                            client=client,
+                            root_fen=effective_root_fen,
+                            target_arg=args.target_score,
+                            current_target=target_score,
+                            banner_pad=True
+                        )
+                        if new_target is not None:
+                            target_score = new_target
+                            explorer.target_score = new_target
 
                     tracked_tasks = run_cycle(
                         client=client,
@@ -2386,8 +2430,14 @@ def main():
                         max_queue=args.max_leaves,
                         budget=target_budget,
                         max_allowed_budget=max_allowed_budget,
-                        dry_run=args.dry_run
+                        dry_run=args.dry_run,
+                        target_arg=args.target_score
                     )
+
+                    if explorer.strategy == "target" and explorer.target_score is not None and target_score != explorer.target_score:
+                        target_score = explorer.target_score
+                        if not tracked_tasks and not args.dry_run:
+                            continue
 
                     if args.dry_run:
                         logger.info(f"Dry run: Pausing {args.idle_interval}s before next check...")
