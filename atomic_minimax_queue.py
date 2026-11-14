@@ -23,10 +23,13 @@ import argparse
 import hashlib
 import logging
 import os
+import re
+import stat
 import sys
 import time
 from dataclasses import dataclass
 from heapq import heappop, heappush
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import requests
@@ -1913,6 +1916,109 @@ def wait_for_completion(
         time.sleep(poll_interval)
 
 
+def _parse_dotenv_file(dotenv_path: Path) -> Dict[str, str]:
+    """Parses simple KEY=VALUE pairs from a `.env` file without extra dependencies."""
+    values: Dict[str, str] = {}
+    if not dotenv_path.is_file():
+        return values
+
+    try:
+        if os.name == "posix" and (stat.S_IMODE(dotenv_path.stat().st_mode) & 0o077):
+            logger.warning(
+                f"Credentials file '{dotenv_path}' is readable by group/others; "
+                f"consider running 'chmod 600 {dotenv_path}'."
+            )
+        text = dotenv_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Could not read '{dotenv_path}': {exc}")
+        return values
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            quote = val[0]
+            val = val[1:-1]
+            if quote == '"':
+                val = re.sub(r'\\(["\\])', r'\1', val)
+        else:
+            val = re.sub(r'\s+#.*$', '', val).strip()
+        values[key] = val
+
+    return values
+
+
+def resolve_credentials(
+    cli_username: str,
+    cli_password: str,
+    dotenv_paths: Optional[List[Path]] = None,
+) -> Tuple[str, str, str]:
+    """
+    Resolves (username, password, source_label) with precedence:
+      1. CLI (-U/--username, -P/--password)
+      2. Process environment (ATOMICDB_USER, ATOMICDB_PASSWORD)
+      3. .env file in working directory or next to the script
+    """
+    if dotenv_paths is None:
+        candidates = [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]
+        dotenv_paths = []
+        seen_paths: Set[Path] = set()
+        for cand in candidates:
+            resolved = cand.resolve()
+            if resolved not in seen_paths:
+                seen_paths.add(resolved)
+                dotenv_paths.append(cand)
+
+    dotenv_vars: Dict[str, str] = {}
+    dotenv_source: Optional[Path] = None
+    for path in dotenv_paths:
+        parsed = _parse_dotenv_file(path)
+        if parsed:
+            for k, v in parsed.items():
+                dotenv_vars.setdefault(k, v)
+            if dotenv_source is None and ("ATOMICDB_USER" in parsed or "ATOMICDB_PASSWORD" in parsed):
+                dotenv_source = path
+
+    env_user = os.environ.get("ATOMICDB_USER", "")
+    env_pass = os.environ.get("ATOMICDB_PASSWORD", "")
+    file_user = dotenv_vars.get("ATOMICDB_USER", "")
+    file_pass = dotenv_vars.get("ATOMICDB_PASSWORD", "")
+
+    fallback_user = env_user or file_user
+    fallback_pass = env_pass or file_pass
+
+    username = cli_username or fallback_user
+    if cli_username and not cli_password and fallback_user and cli_username != fallback_user:
+        logger.warning(
+            f"CLI username '{cli_username}' differs from ATOMICDB_USER '{fallback_user}'; "
+            "ignoring stored ATOMICDB_PASSWORD."
+        )
+        password = ""
+    else:
+        password = cli_password or fallback_pass
+
+    if cli_username or cli_password:
+        source = "CLI"
+    elif env_user or env_pass:
+        source = "env"
+    elif dotenv_source is not None:
+        source = str(dotenv_source)
+    else:
+        source = ""
+
+    return username, password, source
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="AtomicDB Minimax Queue Bot: Finds and queues critical leaf nodes."
@@ -1978,8 +2084,16 @@ def parse_arguments():
         choices=[128000000, 512000000, 2000000000, 10000000000],
         help="Node budget (default: 128000000. Larger budgets like 512000000 or 2000000000 only when explicitly specified)."
     )
-    parser.add_argument("--username", default="", help="OpenBench username")
-    parser.add_argument("--password", default="", help="OpenBench password")
+    parser.add_argument(
+        "-U", "--username",
+        default="",
+        help="OpenBench username (or set ATOMICDB_USER in environment / .env)"
+    )
+    parser.add_argument(
+        "-P", "--password",
+        default="",
+        help="OpenBench password (or set ATOMICDB_PASSWORD in environment / .env)"
+    )
     parser.add_argument("--server", default=DEFAULT_SERVER, help="AtomicDB base URL")
     parser.add_argument("--dry-run", action="store_true", help="Simulate only, do not send real requests")
     parser.add_argument(
@@ -2123,7 +2237,11 @@ def main():
         else "Auto (>= 1 cp if winning, unrestricted if <= 0 cp)"
     )
 
-    client = AtomicDBClient(base_url=args.server, username=args.username, password=args.password)
+    username, password, auth_source = resolve_credentials(args.username, args.password)
+    if username and not password:
+        logger.warning(f"Username '{username}' provided without a password; requests will be unauthenticated.")
+
+    client = AtomicDBClient(base_url=args.server, username=username, password=password)
 
     target_score: Optional[int] = None
     target_desc: str = ""
@@ -2163,8 +2281,9 @@ def main():
     print(f" Budget     : {b_label}")
     print(f" Mode       : {args.mode.upper()}" + (f" (polling: every {args.poll_interval}s)" if args.mode == "loop" else ""))
     print(f" Dry Run    : {args.dry_run}")
-    if args.username:
-        print(f" Account    : {args.username}")
+    if username:
+        source_suffix = f" (via {auth_source})" if auth_source else ""
+        print(f" Account    : {username}{source_suffix}")
     print("================================================================================\n")
 
     explorer = MinimaxFrontierExplorer(

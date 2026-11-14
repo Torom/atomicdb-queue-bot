@@ -122,9 +122,26 @@ uv run atomic_minimax_queue.py --mode loop
 
 ### 4. Authenticated Runs (OpenBench / AtomicDB Account)
 
-When providing your OpenBench account credentials, queued tasks are assigned to your account, granting worker affinity, priority handling, and tracking via your user queue (`my-queue`):
+When providing your OpenBench account credentials, queued tasks are assigned to your account, granting worker affinity, priority handling, and tracking via your user queue (`my-queue`).
+
+Credentials are resolved in the following priority order:
+1. CLI flags (`-U` / `--username`, `-P` / `--password`)
+2. Environment variables (`ATOMICDB_USER`, `ATOMICDB_PASSWORD`)
+3. A `.env` file in the current working directory or next to `atomic_minimax_queue.py` (ignored by Git via `.gitignore`)
+
+Recommended setup using `.env` (compatible with the OpenBench worker) so your password never appears in shell history or `ps`:
 ```bash
-uv run atomic_minimax_queue.py --username YOUR_USERNAME --password YOUR_PASSWORD --mode loop
+cat <<'EOF' > .env
+ATOMICDB_USER=YOUR_USERNAME
+ATOMICDB_PASSWORD=YOUR_PASSWORD
+EOF
+chmod 600 .env
+uv run atomic_minimax_queue.py --mode loop
+```
+
+Or via CLI flags:
+```bash
+uv run atomic_minimax_queue.py -U YOUR_USERNAME -P YOUR_PASSWORD --mode loop
 ```
 
 ---
@@ -173,8 +190,8 @@ You can anchor the search at any line or defense variation:
 | `--max-wait` | `600` | Max wait time in seconds for active tasks before forcing a new cycle (`0` = unlimited) |
 | `--idle-interval` | `30` | Idle wait time in seconds if no tasks are active |
 | `--server` | `https://belzedar.duckdns.org/atomicdb` | AtomicDB base URL |
-| `--username` | `""` | OpenBench username (optional) |
-| `--password` | `""` | OpenBench password (optional) |
+| `-U`, `--username` | `""` | OpenBench username (or `ATOMICDB_USER` via env / `.env`) |
+| `-P`, `--password` | `""` | OpenBench password (or `ATOMICDB_PASSWORD` via env / `.env`) |
 | `--dry-run` | `False` | Simulate traversal without sending queue requests |
 
 ---
