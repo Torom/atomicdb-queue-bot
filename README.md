@@ -77,7 +77,7 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
 
 - **`--strategy target` (Default, Proof-Frontier / Record Breaking)**:
   Directly aims to break or achieve a target score (by default auto-fetched as `highest_score + 1` from `/atomicdb/api/roots`).
-  For White (attacker), it explores top winning candidates. For Black (defender), it explores unrefuted defenses (up to `--defender-branching 2` by default) that hold White below the target score, cutting off branches that already reach the target.
+  The attacker (automatically determined from the root advantage, e.g. White even after `1. Nf3`, or explicitly set via `--attacker`) explores top winning candidates (OR nodes). The defender explores unrefuted defenses (AND nodes, up to `--defender-branching 2` by default) that hold the attacker below the target score, cutting off branches that already reach the target.
   If the tree saturates without finding open leaves, the bot automatically executes a **saturation breaker** (escalating defender-branching to 2, testing 0 cp margin if branching was 1, then escalating margin from 1 cp up to 10 cp) to unblock frontier leaves, reverting to base settings as soon as a leaf is queued.
   Once the target score is achieved in daemon mode, it logs success and automatically advances to the next record!
   ```bash
@@ -101,7 +101,7 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
   ```
 
 - **`--strategy and_or` (Game Tree Solving)**:
-  Treats the root player as the attacker (OR nodes, picking best moves within margin) and the opponent as the defender (AND nodes, queuing multiple unrefuted defensive options up to `--defender-branching`).
+  Treats the advantaged side at the root (or `--attacker w|b`) as the attacker (OR nodes, picking best moves within margin) and the opponent as the defender (AND nodes, queuing multiple unrefuted defensive options up to `--defender-branching`).
   ```bash
   uv run atomic_minimax_queue.py --strategy and_or --margin-cp 10 --defender-branching 3
   ```
@@ -176,6 +176,7 @@ You can anchor the search at any line or defense variation:
 | `--fen` | Start position | Root FEN position for tree traversal |
 | `--moves` | `None` | Initial move sequence in UCI or SAN (`"1. Nf3 f6"`) to set root position |
 | `--strategy` | `target` | Traversal strategy (`target` [default], `margin`, `exact`, `and_or`) |
+| `--attacker` | `auto` | Attacker side (`auto` = side with positive root score, or `w` at 0/unknown; `w` / `b` to override) |
 | `--target-score` | `auto` | Target minimax score in cp (`auto` [default: fetches API record + 1 cp] or explicit integer) |
 | `--margin-cp` | `0` | Centipawn tolerance for near-ties (`0` = strictly best move in `target` mode; `10` in `margin` mode) |
 | `--defender-branching`| `2` | Max defensive moves per AND node (`2` [default], `0` = unlimited) |
@@ -183,7 +184,7 @@ You can anchor the search at any line or defense variation:
 | `--max-leaves` | `0` | Max leaves to queue per cycle (`0` = unlimited) |
 | `--max-queries` | `0` | Max API queries per cycle (`0` = unlimited) |
 | `--skip-zero-cp` | `True` | Skip 0 cp positions (draws / perpetuals) and do not queue them |
-| `--min-score` | `Auto` | Minimum score for root player moves (`>= 1 cp` if winning, unrestricted if `<= 0 cp`) |
+| `--min-score` | `Auto` | Minimum score for attacker moves (`>= 1 cp` if winning, unrestricted if `<= 0 cp`) |
 | `--budget` | `128000000` | Node budget for analysis tasks (default: 128M) |
 | `--mode` | `once` | Operating mode: `once` (single run) or `loop` (reactive daemon) |
 | `--poll-interval` | `1` | Polling interval in seconds to check task progress in loop mode |

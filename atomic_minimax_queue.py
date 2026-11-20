@@ -492,6 +492,34 @@ class AtomicDBClient:
         return None
 
 
+def resolve_attacker_stm(
+    root_stm: str,
+    root_score: Optional[int],
+    attacker_arg: str = "auto"
+) -> str:
+    """
+    Determines which side ('w' or 'b') acts as the attacker (OR node).
+    Explicit 'w'/'b' overrides auto-detection. In 'auto' mode, the side with
+    positive advantage at the root (using STM-POV root_score) is the attacker;
+    for 0 cp or unknown scores, defaults to 'w'.
+    """
+    if attacker_arg in ("w", "b"):
+        return attacker_arg
+    if root_score is not None:
+        if root_score > 0:
+            return root_stm
+        if root_score < 0:
+            return "b" if root_stm == "w" else "w"
+    return "w"
+
+
+def _to_attacker_pov(score: Optional[int], node_stm: str, attacker_stm: str) -> Optional[int]:
+    """Converts a node STM-POV centipawn score into `attacker_stm`-POV."""
+    if score is None:
+        return None
+    return score if node_stm == attacker_stm else -score
+
+
 class MinimaxFrontierExplorer:
     """Traverses the game tree and determines critical leaf nodes."""
 
@@ -507,7 +535,8 @@ class MinimaxFrontierExplorer:
         max_queries: int = 0,
         skip_zero_cp: bool = True,
         min_score: Optional[int] = None,
-        max_no_progress: int = 100
+        max_no_progress: int = 100,
+        attacker_stm: Optional[str] = None
     ):
         self.client = client
         self.strategy = strategy
@@ -520,6 +549,7 @@ class MinimaxFrontierExplorer:
         self.skip_zero_cp = skip_zero_cp
         self.min_score = min_score
         self.max_no_progress = max_no_progress  # 0 = disabled
+        self.attacker_stm = attacker_stm  # 'w', 'b', or None (auto from root score)
         self.known_analyzed_fens: Set[str] = set()
 
     def explore(
@@ -535,6 +565,12 @@ class MinimaxFrontierExplorer:
         """
         root_fen = canonicalize_fen(root_fen)
         root_stm = root_fen.split()[1] if len(root_fen.split()) > 1 else 'w'
+        if self.attacker_stm in ('w', 'b'):
+            attacker_stm = self.attacker_stm
+        else:
+            root_data = self.client.query(root_fen)
+            root_score = root_data.get('score') if root_data else None
+            attacker_stm = resolve_attacker_stm(root_stm, root_score)
         seen_leaves: Set[str] = set()
         visited_nodes: Set[str] = set()
         cycle_attacker_events: List[Tuple[int, List[str]]] = []
@@ -542,10 +578,8 @@ class MinimaxFrontierExplorer:
 
         # Effective min_score:
         # If user explicitly specified min_score, use it.
-        # Otherwise, dynamically determine it from root position score:
-        # If root player has an advantage (> 0 cp), protect that advantage (>= 1 cp).
-        # If root player is disadvantaged or neutral (<= 0 cp, e.g. Black defending against 1. Nf3),
-        # disable min_score (None) to allow exploring best defenses without filtering out negative scores.
+        # Otherwise, dynamically determine it from the attacker's root advantage:
+        # If the attacker is ahead (> 0 cp in attacker POV), protect that advantage (>= 1 cp).
         effective_min_score: Optional[int] = self.min_score
         min_score_initialized = (self.min_score is not None)
 
@@ -555,6 +589,7 @@ class MinimaxFrontierExplorer:
         leaves, effective_min_score, min_score_initialized = self._traverse_frontier(
             initial_nodes=initial_nodes,
             root_stm=root_stm,
+            attacker_stm=attacker_stm,
             effective_min_score=effective_min_score,
             min_score_initialized=min_score_initialized,
             seen_leaves=seen_leaves,
@@ -576,6 +611,7 @@ class MinimaxFrontierExplorer:
                 progress_leaves = self._recover_no_progress_branches(
                     root_fen=root_fen,
                     root_stm=root_stm,
+                    attacker_stm=attacker_stm,
                     effective_min_score=effective_min_score,
                     seen_leaves=seen_leaves,
                     visited_nodes=visited_nodes,
@@ -681,6 +717,7 @@ class MinimaxFrontierExplorer:
         self,
         initial_nodes: List[Tuple[float, int, List[str], Set[str], str, bool, int, int]],
         root_stm: str,
+        attacker_stm: str,
         effective_min_score: Optional[int],
         min_score_initialized: bool,
         seen_leaves: Set[str],
@@ -691,6 +728,7 @@ class MinimaxFrontierExplorer:
         max_leaves_limit: int = 0
     ) -> Tuple[List[LeafCandidate], Optional[int], bool]:
         """Executes priority-queue minimax traversal from initial_nodes and returns discovered leaves."""
+        attacker_parity = 0 if attacker_stm == root_stm else 1
         leaves: List[LeafCandidate] = []
         frontier: List[Tuple[float, int, List[str], Set[str], str, bool, int, int]] = []
         for node in initial_nodes:
@@ -759,7 +797,8 @@ class MinimaxFrontierExplorer:
 
             if not min_score_initialized and depth == 0:
                 min_score_initialized = True
-                if node_score is not None and node_score > 0:
+                att_root_score = _to_attacker_pov(node_score, stm, attacker_stm)
+                if att_root_score is not None and att_root_score > 0:
                     effective_min_score = 1
                 else:
                     effective_min_score = None
@@ -772,14 +811,14 @@ class MinimaxFrontierExplorer:
             if not is_pv:
                 if self.skip_zero_cp and node_score is not None and node_score == 0:
                     continue
-                if effective_min_score is not None and node_score is not None and stm == root_stm and node_score < effective_min_score:
+                if effective_min_score is not None and node_score is not None and stm == attacker_stm and node_score < effective_min_score:
                     continue
 
             if visits == 0:
                 # Position exists in DB but has 0 visits -> leaf node!
                 if self.skip_zero_cp and node_score is not None and node_score == 0:
                     continue
-                if effective_min_score is not None and stm == root_stm and node_score is not None and node_score < effective_min_score:
+                if effective_min_score is not None and stm == attacker_stm and node_score is not None and node_score < effective_min_score:
                     continue
 
                 # In target strategy, evaluate the leaf strictly against the target score:
@@ -787,12 +826,12 @@ class MinimaxFrontierExplorer:
                     # If this is the root FEN itself (depth == 0) and has 0 visits, always queue it!
                     if depth > 0:
                         # Bottleneck search: We only queue leaves that prevent us from achieving target!
-                        # If the leaf score already suffices for target (White >= target), do not queue!
-                        # 1. Attacker (stm == root_stm): White score is node_score
-                        if stm == root_stm and node_score >= self.target_score:
+                        # If the leaf score already suffices for target (Attacker >= target), do not queue!
+                        # 1. Attacker (stm == attacker_stm): Attacker score is node_score
+                        if stm == attacker_stm and node_score >= self.target_score:
                             continue
-                        # 2. Defender (stm != root_stm): White score is -node_score (White >= target iff node_score <= -target)
-                        if stm != root_stm and node_score <= -self.target_score:
+                        # 2. Defender (stm != attacker_stm): Attacker score is -node_score (>= target iff node_score <= -target)
+                        if stm != attacker_stm and node_score <= -self.target_score:
                             continue
 
                 if fen not in seen_leaves:
@@ -824,7 +863,7 @@ class MinimaxFrontierExplorer:
             # Select moves to follow according to chosen strategy
             selected_moves = self._select_moves(
                 stm, moves, best_move,
-                root_stm=root_stm,
+                attacker_stm=attacker_stm,
                 node_score=node_score,
                 effective_min_score=effective_min_score,
                 is_pv=is_pv,
@@ -832,7 +871,7 @@ class MinimaxFrontierExplorer:
             )
 
             if not selected_moves:
-                if self.strategy == "target" and stm != root_stm:
+                if self.strategy == "target" and stm != attacker_stm:
                     logger.debug(f"Branch secured at depth {depth}: all defender responses meet target score.")
                 continue
 
@@ -902,7 +941,7 @@ class MinimaxFrontierExplorer:
                     no_progress_events.append((depth, last_progress_depth, path, is_pv))
                     continue
 
-                if stm != root_stm:
+                if stm != attacker_stm:
                     # Defender forces a draw by repetition (0 cp).
                     # In minimax, a losing defender chooses a draw over losing non-cyclic moves.
                     # This branch ends in a draw and is discarded for the winning-seeking attacker.
@@ -914,12 +953,11 @@ class MinimaxFrontierExplorer:
                     if len(path) >= 1:
                         # Inspect attacker nodes from recent moves (within the cycle range)
                         for p_len in range(len(path) - 1, max(0, len(path) - 16), -1):
-                            is_attacker_turn = (p_len % 2 == 0)
-                            if is_attacker_turn:
+                            if p_len % 2 == attacker_parity:
                                 cycle_attacker_events.append((p_len, path[:p_len]))
                     continue
 
-                # Only the attacker (stm == root_stm) diverges to non-cyclic alternatives
+                # Only the attacker (stm == attacker_stm) diverges to non-cyclic alternatives
                 # to avoid a draw and prove a real win (> 0 cp):
                 non_cyclic_scored = []
                 non_cyclic_unvisited = []
@@ -948,7 +986,7 @@ class MinimaxFrontierExplorer:
                     if m_visits > 0 or m_score is not None:
                         if self.skip_zero_cp and m_score == 0:
                             continue
-                        if stm == root_stm and effective_min_score is not None and m_score is not None and m_score < effective_min_score:
+                        if stm == attacker_stm and effective_min_score is not None and m_score is not None and m_score < effective_min_score:
                             continue
                         # Do not let server-vetoed unsearched claims (< target_score) inflate
                         # best_non_cyclic and crowd out visited non-cyclic branches; demote them
@@ -974,7 +1012,7 @@ class MinimaxFrontierExplorer:
                     if best_non_cyclic is not None:
                         margin_tolerance = 0 if self.strategy == "exact" else self.margin_cp
                         min_allowed = best_non_cyclic - margin_tolerance
-                        if self.skip_zero_cp and (stm == root_stm or best_non_cyclic > 0):
+                        if self.skip_zero_cp and (stm == attacker_stm or best_non_cyclic > 0):
                             if effective_min_score is not None:
                                 min_allowed = max(min_allowed, effective_min_score)
                         for m, c_fen, cand_np, cand_lpd in non_cyclic_scored:
@@ -1034,7 +1072,7 @@ class MinimaxFrontierExplorer:
                 if not child_is_pv:
                     if self.skip_zero_cp and move_score is not None and move_score == 0:
                         continue
-                    if effective_min_score is not None and stm == root_stm and move_score is not None and move_score < effective_min_score:
+                    if effective_min_score is not None and stm == attacker_stm and move_score is not None and move_score < effective_min_score:
                         continue
 
                 # Branch priority calculation (Best-First / depth-first along PV):
@@ -1053,19 +1091,19 @@ class MinimaxFrontierExplorer:
                     # Child has never been analyzed -> leaf node!
                     # In target strategy, evaluate the leaf strictly against the target score:
                     if self.strategy == "target" and self.target_score is not None and move_score is not None:
-                        # 1. Defender (stm != root_stm) made the move to this leaf: White score is -move_score.
-                        # If White already achieves target score (move_score <= -self.target_score), Black is
-                        # refuted here! We never queue Black moves that already concede the target score (even if borrowed).
+                        # 1. Defender (stm != attacker_stm) made the move to this leaf: Attacker score is -move_score.
+                        # If Attacker already achieves target score (move_score <= -self.target_score), Defender is
+                        # refuted here! We never queue Defender moves that already concede the target score (even if borrowed).
                         # Note: The margin_cp only applies on the way down the tree (in _select_moves), not to leaves!
-                        if stm != root_stm and move_score <= -self.target_score:
+                        if stm != attacker_stm and move_score <= -self.target_score:
                             continue
 
-                        # 2. Attacker (stm == root_stm) made the move to this leaf: White score is move_score.
+                        # 2. Attacker (stm == attacker_stm) made the move to this leaf: Attacker score is move_score.
                         # Only prune a move that meets target if this parent node already accepts >= target_score
                         # in its own score; otherwise the server vetoed the unsearched claim (borrowed or walked
                         # with quality=0), so it MUST be searched to lift the parent/root score to the target!
                         if (
-                            stm == root_stm
+                            stm == attacker_stm
                             and node_score is not None
                             and node_score >= self.target_score
                             and move_score >= self.target_score
@@ -1104,6 +1142,7 @@ class MinimaxFrontierExplorer:
         self,
         root_fen: str,
         root_stm: str,
+        attacker_stm: str,
         effective_min_score: Optional[int],
         seen_leaves: Set[str],
         visited_nodes: Set[str],
@@ -1117,13 +1156,13 @@ class MinimaxFrontierExplorer:
         ('progress_exit') and deepens promising already-visited alternative branches so the
         database prefers a real-progress continuation over an endless shuffle.
         """
+        attacker_parity = 0 if attacker_stm == root_stm else 1
         unique_att_nodes: Dict[Tuple[str, ...], Tuple[int, int, List[str], bool]] = {}
         shuffling_ucis_by_prefix: Dict[Tuple[str, ...], Set[str]] = {}
 
         for _ev_depth, last_prog_depth, ev_path, is_pv_ev in no_progress_events:
-            start_d = last_prog_depth if last_prog_depth % 2 == 0 else (last_prog_depth + 1)
-            end_d = len(ev_path) + (1 if len(ev_path) % 2 == 0 else 0)
-            for d in range(start_d, end_d, 2):
+            start_d = last_prog_depth if (last_prog_depth % 2 == attacker_parity) else (last_prog_depth + 1)
+            for d in range(start_d, len(ev_path) + 1, 2):
                 prefix = tuple(ev_path[:d])
                 if d < len(ev_path):
                     shuffling_ucis_by_prefix.setdefault(prefix, set()).add(ev_path[d])
@@ -1287,6 +1326,7 @@ class MinimaxFrontierExplorer:
                 sub_leaves, _, _ = self._traverse_frontier(
                     initial_nodes=sub_initial,
                     root_stm=root_stm,
+                    attacker_stm=attacker_stm,
                     effective_min_score=effective_min_score,
                     min_score_initialized=True,
                     seen_leaves=seen_leaves,
@@ -1358,7 +1398,7 @@ class MinimaxFrontierExplorer:
         stm: str,
         moves: List[dict],
         best_move: Optional[str],
-        root_stm: str = 'w',
+        attacker_stm: str = 'w',
         node_score: Optional[int] = None,
         effective_min_score: Optional[int] = None,
         is_pv: bool = False,
@@ -1373,8 +1413,8 @@ class MinimaxFrontierExplorer:
         if self.skip_zero_cp:
             # Filter out 0 cp moves (draw), preserving best_move if on PV
             scored_moves = [m for m in scored_moves if m['score'] != 0 or (is_pv and best_move and m['uci'] == best_move)]
-            # For root player (attacker), filter out moves below effective_min_score if active
-            if stm == root_stm and effective_min_score is not None:
+            # For attacker, filter out moves below effective_min_score if active
+            if stm == attacker_stm and effective_min_score is not None:
                 scored_moves = [m for m in scored_moves if m['score'] >= effective_min_score or (is_pv and best_move and m['uci'] == best_move)]
 
         if not scored_moves:
@@ -1383,7 +1423,7 @@ class MinimaxFrontierExplorer:
             return []
 
         best_score = max(m['score'] for m in scored_moves)
-        if stm == root_stm and node_score is not None:
+        if stm == attacker_stm and node_score is not None:
             # If server node_score is lower than max child score (e.g. child move loops
             # and was devalued by server backpropagation), orient margin on node_score:
             best_score = min(best_score, node_score)
@@ -1392,8 +1432,8 @@ class MinimaxFrontierExplorer:
             target = self.target_score if self.target_score is not None else 1
             margin_tol = self.margin_cp if self.margin_cp > 0 else 0
 
-            if stm == root_stm:
-                # Attacker (White / OR node): White chooses its attack freely and strictly plays its
+            if stm == attacker_stm:
+                # Attacker (OR node): chooses its attack freely and strictly plays its
                 # single best move (max score), preferring a 50-move-resetting move when equal-score moves tie.
                 if is_pv and best_move:
                     bm_m = next((m for m in scored_moves if m['uci'] == best_move and m.get('status') == 'UNKNOWN'), None)
@@ -1483,13 +1523,13 @@ class MinimaxFrontierExplorer:
                 if m['score'] == best_score and m.get('status') == 'UNKNOWN'
             ]
         elif self.strategy in ("margin", "and_or"):
-            if stm == root_stm or self.strategy == "margin":
+            if stm == attacker_stm or self.strategy == "margin":
                 selected = [
                     m for m in scored_moves
                     if m['score'] >= best_score - self.margin_cp and m.get('status') == 'UNKNOWN'
                 ]
                 # Transposition/cycle resilience: keep up to 2 attacker moves within 30 cp as backups
-                if stm == root_stm and len(selected) < 2:
+                if stm == attacker_stm and len(selected) < 2:
                     backup_margin = max(self.margin_cp, 30)
                     selected = [
                         m for m in scored_moves
@@ -1664,6 +1704,7 @@ def run_cycle(
                         root_fen=root_fen,
                         target_arg=target_arg,
                         current_target=explorer.target_score,
+                        attacker_stm=explorer.attacker_stm,
                         banner_pad=True
                     )
                     if new_target is not None:
@@ -2056,6 +2097,12 @@ def parse_arguments():
              "'and_or' (attacker=OR, defender=AND)"
     )
     parser.add_argument(
+        "--attacker",
+        choices=["auto", "w", "b"],
+        default="auto",
+        help="Side treated as attacker (OR node): 'auto' (side with positive root score, or 'w' at 0/unknown), 'w', or 'b'."
+    )
+    parser.add_argument(
         "--target-score",
         default="auto",
         help="Target score in cp to reach in 'target' strategy (default: 'auto' = fetches record from /atomicdb/api/roots + 1 cp, or specify integer like 1256)"
@@ -2144,10 +2191,12 @@ def resolve_target_score(
     root_fen: str,
     target_arg: str,
     min_target: Optional[int] = None,
-    curr_score: Optional[int] = None
+    curr_score: Optional[int] = None,
+    attacker_stm: str = "w"
 ) -> Tuple[int, str, Optional[dict]]:
     """
-    Resolves the target score (in centipawns) for the given root position.
+    Resolves the target score (in centipawns, in `attacker_stm` POV) for the given root position.
+    `curr_score`, if provided, is the raw STM-POV score from `/api/query` for `root_fen`.
     Returns (target_score, description, position_record).
     """
     if target_arg.lower() != "auto":
@@ -2160,32 +2209,39 @@ def resolve_target_score(
         except ValueError:
             logger.warning(f"Invalid --target-score value '{target_arg}'. Defaulting to 'auto'.")
 
+    root_stm = root_fen.split()[1] if len(root_fen.split()) > 1 else 'w'
+
     # Auto resolution from /atomicdb/api/roots combined with live root score
     rec = client.get_position_record(fen=root_fen)
-    best_rec_val = rec.get('best_value') if rec else None
+    if rec:
+        if attacker_stm == 'w':
+            best_rec_val = rec.get('best_value')
+        else:
+            worst_val = rec.get('worst_value')
+            best_rec_val = -worst_val if worst_val is not None else None
+    else:
+        best_rec_val = None
 
     # Fetch live score to ensure target doesn't lag behind asynchronous record updates
     if curr_score is None:
         data = client.query(root_fen, bypass_cache=True)
         curr_score = data.get('score') if data else None
+    att_curr_score = _to_attacker_pov(curr_score, root_stm, attacker_stm)
 
-    if best_rec_val is not None or curr_score is not None:
-        if best_rec_val is not None and curr_score is not None:
-            effective_record = max(best_rec_val, curr_score)
-            source = "record"
-        elif best_rec_val is not None:
+    if best_rec_val is not None or att_curr_score is not None:
+        if best_rec_val is not None and (att_curr_score is None or best_rec_val >= att_curr_score):
             effective_record = best_rec_val
-            source = "record"
+            source = "from /api/roots: record"
         else:
-            effective_record = curr_score
-            source = "current score"
+            effective_record = att_curr_score
+            source = "from /api/query: current score"
 
         target = effective_record + 1
         if min_target is not None and target < min_target:
             target = min_target
 
         if effective_record is not None and target == effective_record + 1:
-            return target, f"auto-fetched from /api/roots: {source} {effective_record:+d} cp + 1 cp", rec
+            return target, f"auto-fetched {source} {effective_record:+d} cp + 1 cp", rec
         else:
             return target, f"auto-advanced beyond current root score: {target:+d} cp", rec
 
@@ -2199,6 +2255,7 @@ def refresh_target_score(
     root_fen: str,
     target_arg: str,
     current_target: int,
+    attacker_stm: Optional[str] = None,
     banner_pad: bool = False
 ) -> Optional[int]:
     """
@@ -2206,8 +2263,11 @@ def refresh_target_score(
     If the target was reached or superseded by a higher record, prints a banner
     and returns the updated target_score; otherwise returns None.
     """
+    root_stm = root_fen.split()[1] if len(root_fen.split()) > 1 else 'w'
     root_data = client.query(root_fen, bypass_cache=True)
-    cur_score = root_data.get('score') if root_data else None
+    raw_score = root_data.get('score') if root_data else None
+    eff_attacker = attacker_stm if attacker_stm in ('w', 'b') else resolve_attacker_stm(root_stm, raw_score)
+    cur_score = _to_attacker_pov(raw_score, root_stm, eff_attacker)
 
     if cur_score is not None and cur_score >= current_target:
         if banner_pad:
@@ -2220,7 +2280,8 @@ def refresh_target_score(
             root_fen=root_fen,
             target_arg=target_arg,
             min_target=cur_score + 1,
-            curr_score=cur_score
+            curr_score=raw_score,
+            attacker_stm=eff_attacker
         )
         logger.info(f"Advancing to next target: {new_target:+d} cp ({desc})\n")
         return new_target
@@ -2231,10 +2292,19 @@ def refresh_target_score(
             root_fen=root_fen,
             target_arg="auto",
             min_target=current_target,
-            curr_score=cur_score
+            curr_score=raw_score,
+            attacker_stm=eff_attacker
         )
         if fresh_target > current_target:
-            rec_val = fresh_rec.get('best_value') if fresh_rec else (fresh_target - 1)
+            if fresh_rec:
+                rec_val = (
+                    fresh_rec.get('best_value') if eff_attacker == 'w'
+                    else (-fresh_rec['worst_value'] if fresh_rec.get('worst_value') is not None else None)
+                )
+            else:
+                rec_val = None
+            if rec_val is None:
+                rec_val = fresh_target - 1
             if banner_pad:
                 print()
             print("=" * 80)
@@ -2311,6 +2381,18 @@ def main():
 
     client = AtomicDBClient(base_url=args.server, username=username, password=password)
 
+    init_root_data = client.query(effective_root_fen, bypass_cache=True)
+    init_raw_score = init_root_data.get('score') if init_root_data else None
+    attacker_stm = resolve_attacker_stm(root_stm, init_raw_score, args.attacker)
+    attacker_name = "White" if attacker_stm == 'w' else "Black"
+    init_att_score = _to_attacker_pov(init_raw_score, root_stm, attacker_stm)
+    if args.attacker != "auto":
+        att_desc = f"explicit --attacker {args.attacker}"
+    elif init_att_score is not None:
+        att_desc = f"auto from root score: {init_att_score:+d} cp"
+    else:
+        att_desc = "default White (root score unavailable)"
+
     target_score: Optional[int] = None
     target_desc: str = ""
     rec_dict: Optional[dict] = None
@@ -2318,7 +2400,9 @@ def main():
         target_score, target_desc, rec_dict = resolve_target_score(
             client=client,
             root_fen=effective_root_fen,
-            target_arg=args.target_score
+            target_arg=args.target_score,
+            curr_score=init_raw_score,
+            attacker_stm=attacker_stm
         )
 
     eff_margin_cp = 10 if (args.strategy == "margin" and args.margin_cp == 0) else args.margin_cp
@@ -2331,8 +2415,9 @@ def main():
     margin_display = f"margin: {eff_margin_cp} cp" if eff_margin_cp > 0 else "strict best move"
     print(f" Strategy   : {args.strategy.upper()} ({margin_display})")
     if args.strategy == "target" and target_score is not None:
-        print(f" Target     : {target_score:+d} cp ({target_desc})")
+        print(f" Target     : {target_score:+d} cp for {attacker_name} ({target_desc})")
     print(f" Root FEN   : {effective_root_fen} ({stm_name} to move)")
+    print(f" Attacker   : {attacker_name} (OR) vs {'Black' if attacker_stm == 'w' else 'White'} (AND) [{att_desc}]")
     if moves_san_display:
         wrapped_moves = wrap_san_path(moves_san_display, indent_len=14)
         print(f" Moves      : {wrapped_moves[0]}")
@@ -2365,22 +2450,22 @@ def main():
         max_queries=args.max_queries,
         skip_zero_cp=args.skip_zero_cp,
         min_score=args.min_score,
-        max_no_progress=args.max_no_progress
+        max_no_progress=args.max_no_progress,
+        attacker_stm=attacker_stm
     )
 
     if args.strategy == "target" and target_score is not None:
-        root_data = client.query(effective_root_fen, bypass_cache=True)
-        cur_score = root_data.get('score') if root_data else None
-        if cur_score is not None and cur_score >= target_score:
+        if init_att_score is not None and init_att_score >= target_score:
             print("=" * 80)
-            print(f" 🏆 TARGET ALREADY ACHIEVED! Root score is {cur_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
+            print(f" 🏆 TARGET ALREADY ACHIEVED! Root score is {init_att_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
             print("=" * 80)
             target_score, target_desc, _ = resolve_target_score(
                 client=client,
                 root_fen=effective_root_fen,
                 target_arg=args.target_score,
-                min_target=cur_score + 1,
-                curr_score=cur_score
+                min_target=init_att_score + 1,
+                curr_score=init_raw_score,
+                attacker_stm=attacker_stm
             )
             explorer.target_score = target_score
             logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
@@ -2417,6 +2502,7 @@ def main():
                             root_fen=effective_root_fen,
                             target_arg=args.target_score,
                             current_target=target_score,
+                            attacker_stm=attacker_stm,
                             banner_pad=True
                         )
                         if new_target is not None:
