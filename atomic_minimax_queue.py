@@ -2162,8 +2162,8 @@ def parse_arguments():
     parser.add_argument(
         "--mode",
         choices=["once", "loop"],
-        default="once",
-        help="Operating mode: 'once' (single pass) or 'loop' (reactive daemon)"
+        default="loop",
+        help="Operating mode: 'once' (single pass) or 'loop' (reactive daemon, default: loop)"
     )
     parser.add_argument(
         "--poll-interval",
