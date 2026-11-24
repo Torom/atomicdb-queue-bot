@@ -28,6 +28,7 @@ import re
 import stat
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from heapq import heappop, heappush
 from pathlib import Path
@@ -641,6 +642,234 @@ class MinimaxFrontierExplorer:
             for leaf in batch:
                 on_leaf(leaf)
 
+    def rebackprop_cache(self, root_fen: Optional[str] = None) -> int:
+        """
+        Recomputes negamax scores/statuses bottom-up across all nodes currently
+        in `self.client.cache` so fresh leaf evaluations propagate locally even
+        when the server's deferred propagation queue lags behind.
+        When `root_fen` is provided, excludes backward/cross cycle edges
+        (`depth(child) <= depth(parent)`) to avoid repetition echo loops.
+        Returns the number of parent nodes whose score/best_move/status changed.
+        """
+        cache = self.client.cache
+        orig_scores: Dict[str, Optional[int]] = {}
+        orig_best_moves: Dict[str, Optional[str]] = {}
+        raw_edges: Dict[str, List[Tuple[int, str, str]]] = {}
+        stale_bm_nodes: Set[str] = set()
+
+        def _is_best_move_stale(node_data: dict) -> bool:
+            bm_uci = node_data.get('best_move')
+            if not bm_uci:
+                return False
+            node_moves = node_data.get('moves') or []
+            bm_m = next((m for m in node_moves if m.get('uci') == bm_uci), None)
+            if not bm_m or bm_m.get('floor', False):
+                return False
+            if bm_m.get('visits', 0) <= 0 and bm_m.get('status', 'UNKNOWN') == 'UNKNOWN':
+                return False
+            bm_score = bm_m.get('score')
+            return bm_score is not None and bm_score != node_data.get('score')
+
+        for fen, data in list(cache.items()):
+            if not data or data.get('status', 'UNKNOWN') != 'UNKNOWN':
+                continue
+            orig_scores[fen] = data.get('score')
+            orig_best_moves[fen] = data.get('best_move')
+            if data.get('visits', 0) <= 0:
+                continue
+            moves = data.get('moves')
+            if not moves:
+                continue
+            try:
+                board = chess.variant.AtomicBoard(fen)
+            except Exception:
+                continue
+
+            edges_list: List[Tuple[int, str, str]] = []
+            for move_idx, m in enumerate(moves):
+                uci = m.get('uci')
+                if not uci:
+                    continue
+                try:
+                    mv = chess.Move.from_uci(uci)
+                    board.push(mv)
+                    child_fen = canonicalize_fen(board.fen())
+                    board.pop()
+                except Exception:
+                    continue
+                if cache.get(child_fen) is not None:
+                    edges_list.append((move_idx, uci, child_fen))
+            if edges_list:
+                raw_edges[fen] = edges_list
+            if _is_best_move_stale(data):
+                stale_bm_nodes.add(fen)
+
+        depth_from_root: Dict[str, int] = {}
+        if root_fen:
+            canon_root = canonicalize_fen(root_fen)
+            if cache.get(canon_root) is not None:
+                depth_from_root[canon_root] = 0
+                bfs = deque([canon_root])
+                while bfs:
+                    cur_f = bfs.popleft()
+                    cur_d = depth_from_root[cur_f]
+                    for _mi, _u, ch_f in raw_edges.get(cur_f, ()):
+                        if ch_f not in depth_from_root:
+                            depth_from_root[ch_f] = cur_d + 1
+                            bfs.append(ch_f)
+
+        graph: Dict[str, List[Tuple[int, str, str]]] = {}
+        back_edge_ucis: Dict[str, Set[str]] = {}
+        for fen, edges_list in raw_edges.items():
+            parent_d = depth_from_root.get(fen)
+            if parent_d is not None:
+                fwd_edges: List[Tuple[int, str, str]] = []
+                back_ucis: Set[str] = set()
+                for item in edges_list:
+                    child_d = depth_from_root.get(item[2])
+                    if child_d is not None and child_d <= parent_d:
+                        back_ucis.add(item[1])
+                    else:
+                        fwd_edges.append(item)
+                if back_ucis:
+                    back_edge_ucis[fen] = back_ucis
+                if fwd_edges or fen in stale_bm_nodes:
+                    graph[fen] = fwd_edges
+            else:
+                graph[fen] = edges_list
+
+        for fen in stale_bm_nodes:
+            if fen not in graph:
+                graph[fen] = []
+
+        if not graph:
+            return 0
+
+        updated_fens: Set[str] = set()
+        for _ in range(64):
+            changed = False
+            for fen, edges_list in graph.items():
+                data = cache.get(fen)
+                if not data or data.get('status', 'UNKNOWN') != 'UNKNOWN':
+                    continue
+                parent_stm = fen.split()[1] if len(fen.split()) > 1 else 'w'
+                moves = data.get('moves', [])
+                copied_data: Optional[dict] = None
+                copied_moves: Optional[List[dict]] = None
+                edge_updated = False
+
+                for move_idx, _uci, child_fen in edges_list:
+                    child_data = cache.get(child_fen)
+                    if not child_data:
+                        continue
+                    child_visits = child_data.get('visits', 0)
+                    child_status = child_data.get('status', 'UNKNOWN')
+                    if child_visits <= 0 and child_status == 'UNKNOWN':
+                        continue
+
+                    if child_status == 'DRAW':
+                        fresh_score: Optional[int] = 0
+                    elif child_status == 'WHITE_WIN':
+                        fresh_score = 30000 if parent_stm == 'w' else -30000
+                    elif child_status == 'BLACK_WIN':
+                        fresh_score = 30000 if parent_stm == 'b' else -30000
+                    else:
+                        c_score = child_data.get('score')
+                        fresh_score = -c_score if c_score is not None else None
+
+                    cur_m = (copied_moves if copied_moves is not None else moves)[move_idx]
+                    new_m_score = fresh_score if fresh_score is not None else cur_m.get('score')
+                    new_m_visits = max(cur_m.get('visits', 0), child_visits)
+                    new_m_borrowed = False if child_visits > 0 else cur_m.get('borrowed', False)
+
+                    if (
+                        new_m_score != cur_m.get('score')
+                        or child_status != cur_m.get('status', 'UNKNOWN')
+                        or new_m_visits != cur_m.get('visits', 0)
+                        or new_m_borrowed != cur_m.get('borrowed', False)
+                    ):
+                        if copied_data is None:
+                            copied_data = dict(data)
+                            copied_moves = list(moves)
+                        m_copy = dict(cur_m)
+                        m_copy['score'] = new_m_score
+                        m_copy['status'] = child_status
+                        m_copy['visits'] = new_m_visits
+                        m_copy['borrowed'] = new_m_borrowed
+                        copied_moves[move_idx] = m_copy
+                        edge_updated = True
+
+                if not edge_updated:
+                    if not _is_best_move_stale(data):
+                        continue
+                    copied_data = dict(data)
+                    copied_moves = list(moves)
+                elif copied_data is None or copied_moves is None:
+                    continue
+
+                orig_s = orig_scores.get(fen)
+                orig_bm = orig_best_moves.get(fen)
+                back_ucis = back_edge_ucis.get(fen)
+                trusted = [
+                    m for m in copied_moves
+                    if not m.get('floor', False)
+                    and m.get('score') is not None
+                    and not (
+                        m.get('visits', 0) == 0
+                        and m.get('status', 'UNKNOWN') == 'UNKNOWN'
+                        and orig_s is not None
+                        and m['score'] > orig_s
+                    )
+                ]
+                if back_ucis:
+                    trusted_no_back = [m for m in trusted if m.get('uci') not in back_ucis]
+                    if trusted_no_back:
+                        trusted = trusted_no_back
+
+                new_score = copied_data.get('score')
+                new_best = copied_data.get('best_move')
+                best_m: Optional[dict] = None
+                if trusted:
+                    best_m = max(
+                        trusted,
+                        key=lambda m: (
+                            m['score'],
+                            1 if m.get('uci') == orig_bm else 0,
+                            1 if m.get('visits', 0) > 0 else 0,
+                            m.get('visits', 0),
+                        ),
+                    )
+                    new_score = best_m['score']
+                    new_best = best_m.get('uci')
+
+                win_status = 'WHITE_WIN' if parent_stm == 'w' else 'BLACK_WIN'
+                loss_status = 'BLACK_WIN' if parent_stm == 'w' else 'WHITE_WIN'
+                new_status = copied_data.get('status', 'UNKNOWN')
+                if best_m is not None and best_m.get('status') == win_status:
+                    new_status = win_status
+                elif copied_moves and all(m.get('status') == loss_status for m in copied_moves):
+                    new_status = loss_status
+
+                copied_data['moves'] = copied_moves
+                node_changed = (
+                    new_score != data.get('score')
+                    or new_best != data.get('best_move')
+                    or new_status != data.get('status', 'UNKNOWN')
+                )
+                copied_data['score'] = new_score
+                copied_data['best_move'] = new_best
+                copied_data['status'] = new_status
+                cache[fen] = copied_data
+
+                if node_changed:
+                    updated_fens.add(fen)
+                    changed = True
+
+            if not changed:
+                break
+
+        return len(updated_fens)
+
     def explore(
         self,
         root_fen: str,
@@ -736,6 +965,12 @@ class MinimaxFrontierExplorer:
                 if not att_data:
                     continue
 
+                att_node_score = att_data.get('score')
+                min_cycle_score: Optional[int] = None
+                if self.strategy == "target" and self.target_score is not None:
+                    ref_score = min(self.target_score, att_node_score) if att_node_score is not None else self.target_score
+                    min_cycle_score = ref_score - max(self.margin_cp, 100)
+
                 for m in att_data.get('moves', []):
                     uci = m.get('uci')
                     if not uci or m.get('floor', False) or m.get('status') not in ('UNKNOWN', None):
@@ -745,6 +980,13 @@ class MinimaxFrontierExplorer:
                     m_score = m.get('score')
                     if self.skip_zero_cp and m_score is not None and m_score == 0:
                         continue
+                    if effective_min_score is not None and m_score is not None and m_score < effective_min_score:
+                        continue
+                    if min_cycle_score is not None:
+                        if m_score is not None and m_score < min_cycle_score:
+                            continue
+                        if m_score is None and self.margin_cp > 0:
+                            continue
 
                     try:
                         move_obj = b_att.parse_uci(uci)
@@ -912,6 +1154,8 @@ class MinimaxFrontierExplorer:
 
             if visits == 0:
                 # Position exists in DB but has 0 visits -> leaf node!
+                if fen in self.known_analyzed_fens:
+                    continue
                 if self.skip_zero_cp and node_score is not None and node_score == 0:
                     continue
                 if effective_min_score is not None and stm == attacker_stm and node_score is not None and node_score < effective_min_score:
@@ -1057,6 +1301,10 @@ class MinimaxFrontierExplorer:
                 # to avoid a draw and prove a real win (> 0 cp):
                 non_cyclic_scored = []
                 non_cyclic_unvisited = []
+                min_cycle_score: Optional[int] = None
+                if self.strategy == "target" and self.target_score is not None:
+                    ref_score = min(self.target_score, node_score) if node_score is not None else self.target_score
+                    min_cycle_score = ref_score - max(self.margin_cp, 100)
 
                 for m in moves:
                     uci = m.get('uci')
@@ -1084,6 +1332,8 @@ class MinimaxFrontierExplorer:
                             continue
                         if stm == attacker_stm and effective_min_score is not None and m_score is not None and m_score < effective_min_score:
                             continue
+                        if min_cycle_score is not None and m_score is not None and m_score < min_cycle_score:
+                            continue
                         # Do not let server-vetoed unsearched claims (< target_score) inflate
                         # best_non_cyclic and crowd out visited non-cyclic branches; demote them
                         # to Path 2 unvisited cycle exits instead.
@@ -1099,6 +1349,8 @@ class MinimaxFrontierExplorer:
                         else:
                             non_cyclic_scored.append((m, c_fen, cand_np, cand_lpd))
                     else:
+                        if min_cycle_score is not None and self.margin_cp > 0:
+                            continue
                         non_cyclic_unvisited.append((m, c_fen, cand_np, cand_lpd))
 
                 # Path 1: Scored non-cyclic moves exist
@@ -1675,7 +1927,8 @@ def run_cycle(
     budget: int,
     max_allowed_budget: int,
     dry_run: bool,
-    target_arg: str = "auto"
+    target_arg: str = "auto",
+    breaker_max_leaves: int = 32
 ) -> List[dict]:
     """
     Executes a single analysis and queuing pass.
@@ -1690,6 +1943,7 @@ def run_cycle(
     queued_count = 0
     leaf_idx = 0
     already_analyzed_count = 0
+    current_max_queue = max_queue
 
     def emit_leaf_header(leaf: LeafCandidate) -> None:
         nonlocal leaf_idx
@@ -1735,7 +1989,7 @@ def run_cycle(
 
     def handle_single_request(leaf: LeafCandidate) -> None:
         nonlocal queued_count, already_analyzed_count
-        if max_queue and max_queue > 0 and queued_count >= max_queue:
+        if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
             return
 
         emit_leaf_header(leaf)
@@ -1753,6 +2007,7 @@ def run_cycle(
         if status in ('already-analyzed', 'already-solved'):
             explorer.known_analyzed_fens.add(leaf.fen)
             already_analyzed_count += 1
+            client.query(leaf.fen, bypass_cache=True)
             completed_budget = resp.get('completed_budget')
             b_label = format_budget(completed_budget) if completed_budget else "?"
             print(f"     --> Status: {status} (already analyzed with {b_label} nodes)\n")
@@ -1799,7 +2054,7 @@ def run_cycle(
 
     def handle_leaves(batch: List[LeafCandidate]) -> None:
         nonlocal queued_count, already_analyzed_count
-        if max_queue and max_queue > 0 and queued_count >= max_queue:
+        if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
             return
 
         filtered: List[LeafCandidate] = []
@@ -1814,7 +2069,7 @@ def run_cycle(
 
         if dry_run:
             for leaf in filtered:
-                if max_queue and max_queue > 0 and queued_count >= max_queue:
+                if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
                     break
                 emit_leaf_header(leaf)
                 queued_count += 1
@@ -1830,15 +2085,15 @@ def run_cycle(
                 singles.append(leaf)
 
         for leaf in singles:
-            if max_queue and max_queue > 0 and queued_count >= max_queue:
+            if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
                 return
             handle_single_request(leaf)
 
         for parent_fen, parent_leaves in by_parent.items():
             idx = 0
             while idx < len(parent_leaves):
-                if max_queue and max_queue > 0:
-                    remaining = max_queue - queued_count
+                if current_max_queue and current_max_queue > 0:
+                    remaining = current_max_queue - queued_count
                     if remaining <= 0:
                         return
                     chunk_size = min(REQUEST_CHILDREN_MAX_SELECT, remaining)
@@ -1894,6 +2149,7 @@ def run_cycle(
                         task_id = entry.get('task')
                         key = entry.get('key') or key_of(leaf.fen)
                         budget_nodes = entry.get('budget_nodes')
+                        task_state = entry.get('task_state')
 
                         if budget_nodes and budget_nodes > max_allowed_budget:
                             b_str = format_budget(budget_nodes)
@@ -1912,7 +2168,11 @@ def run_cycle(
                                 )
                             continue
 
-                        extra_str = format_extra(task_id=task_id, budget_nodes=budget_nodes)
+                        extra_str = format_extra(
+                            task_id=task_id,
+                            task_state=task_state,
+                            budget_nodes=budget_nodes,
+                        )
                         print(f"     --> Status: {'queued':<15}{extra_str}\n")
                         queued_count += 1
                         tracked_tasks.append({
@@ -1928,6 +2188,7 @@ def run_cycle(
                         if st in ('already-analyzed', 'closed', 'already-solved', 'ladder-spent'):
                             explorer.known_analyzed_fens.add(leaf.fen)
                             already_analyzed_count += 1
+                            client.query(leaf.fen, bypass_cache=True)
                             completed_budget = entry.get('completed_budget')
                             if completed_budget:
                                 b_label = format_budget(completed_budget)
@@ -1937,8 +2198,20 @@ def run_cycle(
                         elif st in ('already-queued', 'already-requested'):
                             task_id = entry.get('task')
                             key = entry.get('key') or key_of(leaf.fen)
+                            budget_nodes = entry.get('budget_nodes')
+                            task_state = entry.get('task_state')
+                            if st == 'already-queued' and budget_nodes and budget_nodes > max_allowed_budget:
+                                b_str = format_budget(budget_nodes)
+                                max_str = format_budget(max_allowed_budget)
+                                print(
+                                    f"     --> [IGNORED] Task #{task_id} running with {b_str} nodes "
+                                    f"(> {max_str}). Not tracking.\n"
+                                )
+                                continue
                             extra_str = format_extra(
                                 task_id=task_id,
+                                task_state=task_state,
+                                budget_nodes=budget_nodes,
                                 backed=bool(entry.get('backed', False)),
                             )
                             print(f"     --> Status: {st:<15}{extra_str}\n")
@@ -1965,68 +2238,130 @@ def run_cycle(
             logger.info("No open leaf nodes queued (all discovered leaves already analyzed).")
 
         if explorer.strategy == "target" and explorer.target_score is not None:
-            orig_margin = explorer.margin_cp
-            orig_branching = explorer.defender_branching
-            breaker_branching = max(2, orig_branching)
-            # If regular pass ran with defender_branching < 2, first try defender_branching = 2
-            # with margin 0 cp before escalating the margin tolerance.
-            start_margin = 0 if orig_branching < breaker_branching else max(1, orig_margin + 1)
-            try:
-                explorer.defender_branching = breaker_branching
-                for breaker_margin in range(start_margin, 11):
-                    new_target = refresh_target_score(
-                        client=client,
-                        root_fen=root_fen,
-                        target_arg=target_arg,
-                        current_target=explorer.target_score,
-                        attacker_stm=explorer.attacker_stm,
-                        banner_pad=True
-                    )
-                    if new_target is not None:
-                        explorer.target_score = new_target
-                        logger.info(
-                            f"[BREAKER] Target updated to {new_target:+d} cp; "
-                            f"aborting breaker pass to restart from margin {orig_margin} cp."
-                        )
-                        break
+            orig_target = explorer.target_score
+            server_target_updated = False
+            canon_root = canonicalize_fen(root_fen)
+            root_stm = canon_root.split()[1] if len(canon_root.split()) > 1 else 'w'
 
+            def _maybe_advance_local_target(log_prefix: str = "[RE-BACKPROP]") -> None:
+                root_cached = client.cache.get(canon_root)
+                local_raw = root_cached.get('score') if root_cached else None
+                eff_att = (
+                    explorer.attacker_stm if explorer.attacker_stm in ('w', 'b')
+                    else resolve_attacker_stm(root_stm, local_raw)
+                )
+                local_att = _to_attacker_pov(local_raw, root_stm, eff_att)
+                if local_att is not None and explorer.target_score is not None and local_att >= explorer.target_score:
+                    local_target = local_att + 1
+                    prev_target = explorer.target_score
+                    explorer.target_score = local_target
                     logger.info(
-                        f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
-                        f"Trying margin: {breaker_margin} cp (def-branch: {breaker_branching})..."
+                        f"{log_prefix} Local root score reached {local_att:+d} cp "
+                        f"(>= target {prev_target:+d} cp); advancing pass target locally to {local_target:+d} cp."
                     )
-                    explorer.margin_cp = breaker_margin
-                    client.query_count = 0
-                    queued_before_breaker = queued_count
-                    analyzed_before_breaker = already_analyzed_count
-                    breaker_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
-                    print("=" * 78)
-                    breaker_queued = queued_count - queued_before_breaker
-                    breaker_analyzed = already_analyzed_count - analyzed_before_breaker
 
-                    if breaker_queued > 0:
-                        extra_info = [f"{breaker_queued} queued"]
-                        if breaker_analyzed > 0:
-                            extra_info.append(f"{breaker_analyzed} already analyzed")
-                        summary_str = ", ".join(extra_info)
+            try:
+                # 1. Local In-Memory Re-Backprop across cached nodes before escalating:
+                for _re_round in range(5):
+                    updated_nodes = explorer.rebackprop_cache(root_fen)
+                    if updated_nodes <= 0:
+                        break
+                    logger.info(
+                        f"[RE-BACKPROP] Locally updated {updated_nodes} stale parent node(s) in cache; "
+                        f"re-traversing at base settings..."
+                    )
+                    _maybe_advance_local_target("[RE-BACKPROP]")
+                    client.query_count = 0
+                    queued_before_re = queued_count
+                    analyzed_before_re = already_analyzed_count
+                    re_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
+                    print("=" * 78)
+                    re_queued = queued_count - queued_before_re
+                    re_analyzed = already_analyzed_count - analyzed_before_re
+                    if re_queued > 0:
+                        extra_info = [f"{re_queued} queued"]
+                        if re_analyzed > 0:
+                            extra_info.append(f"{re_analyzed} already analyzed")
                         logger.info(
-                            f"[BREAKER] Traversal complete: {len(breaker_leaves)} leaves found, "
-                            f"{summary_str} ({client.query_count} queries at margin {breaker_margin} cp, def-branch: {breaker_branching})."
+                            f"[RE-BACKPROP] Traversal complete: {len(re_leaves)} leaves found, "
+                            f"{', '.join(extra_info)} ({client.query_count} queries)."
                         )
                         break
+                    logger.info(
+                        f"[RE-BACKPROP] No leaves queued ({len(re_leaves)} found, "
+                        f"{re_analyzed} already analyzed, {client.query_count} queries)."
+                    )
+
+                if queued_count == 0 and explorer.defender_branching > 0:
+                    orig_branching = explorer.defender_branching
+                    orig_max_leaves = explorer.max_leaves
+                    orig_max_queue = current_max_queue
+
+                    if max_queue > 0 and breaker_max_leaves > 0:
+                        breaker_limit = min(max_queue, breaker_max_leaves)
+                    elif breaker_max_leaves > 0:
+                        breaker_limit = breaker_max_leaves
                     else:
-                        if not breaker_leaves:
-                            logger.info(f"[BREAKER] No open leaf nodes found (margin: {breaker_margin} cp, def-branch: {breaker_branching}).")
-                        else:
+                        breaker_limit = max_queue
+
+                    stage_label = f"AND-width (def=unlimited, {explorer.margin_cp}cp)"
+                    try:
+                        new_target = refresh_target_score(
+                            client=client,
+                            root_fen=root_fen,
+                            target_arg=target_arg,
+                            current_target=orig_target,
+                            attacker_stm=explorer.attacker_stm,
+                            banner_pad=True
+                        )
+                        if new_target is not None:
+                            explorer.target_score = new_target
+                            server_target_updated = True
                             logger.info(
-                                f"[BREAKER] No leaves queued ({len(breaker_leaves)} found, 0 queued at margin {breaker_margin} cp, def-branch: {breaker_branching})."
+                                f"[BREAKER] Target updated to {new_target:+d} cp; "
+                                f"aborting breaker pass to restart from def-branch {orig_branching}."
                             )
-                        if breaker_margin < 10:
-                            logger.info(f"[BREAKER] Escalating margin from {breaker_margin} cp to {breaker_margin + 1} cp...")
                         else:
-                            logger.info("[BREAKER] No open leaf nodes found up to margin 10 cp.")
+                            explorer.rebackprop_cache(root_fen)
+                            _maybe_advance_local_target("[BREAKER]")
+                            logger.info(
+                                f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
+                                f"Trying {stage_label} "
+                                f"(max leaves: {breaker_limit if breaker_limit > 0 else 'unlimited'})..."
+                            )
+                            explorer.defender_branching = 0
+                            explorer.max_leaves = breaker_limit
+                            current_max_queue = breaker_limit
+                            client.query_count = 0
+                            queued_before_breaker = queued_count
+                            analyzed_before_breaker = already_analyzed_count
+                            breaker_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
+                            print("=" * 78)
+                            breaker_queued = queued_count - queued_before_breaker
+                            breaker_analyzed = already_analyzed_count - analyzed_before_breaker
+
+                            if breaker_queued > 0:
+                                extra_info = [f"{breaker_queued} queued"]
+                                if breaker_analyzed > 0:
+                                    extra_info.append(f"{breaker_analyzed} already analyzed")
+                                summary_str = ", ".join(extra_info)
+                                logger.info(
+                                    f"[BREAKER] Traversal complete ({stage_label}): {len(breaker_leaves)} leaves found, "
+                                    f"{summary_str} ({client.query_count} queries)."
+                                )
+                            elif not breaker_leaves:
+                                logger.info(f"[BREAKER] No open leaf nodes found ({stage_label}).")
+                            else:
+                                logger.info(
+                                    f"[BREAKER] No leaves queued ({len(breaker_leaves)} found, 0 queued at {stage_label})."
+                                )
+                    finally:
+                        explorer.defender_branching = orig_branching
+                        explorer.max_leaves = orig_max_leaves
+                        current_max_queue = orig_max_queue
             finally:
-                explorer.margin_cp = orig_margin
-                explorer.defender_branching = orig_branching
+                if not server_target_updated:
+                    explorer.target_score = orig_target
     else:
         extra_info = [f"{queued_count} queued"]
         if already_analyzed_count > 0:
@@ -2044,7 +2379,7 @@ def run_cycle(
 def wait_for_completion(
     client: AtomicDBClient,
     tracked_tasks: List[dict],
-    poll_interval: int = 1,
+    poll_interval: int = 5,
     max_wait: int = 600
 ) -> bool:
     """
@@ -2402,6 +2737,12 @@ def parse_arguments():
         help="Max plies without capture or pawn move before treating as a 50-move draw and building progress paths (0 = disabled, default: 100)"
     )
     parser.add_argument("--max-leaves", type=int, default=0, help="Max leaves per cycle (0 = all discovered, default: 0)")
+    parser.add_argument(
+        "--breaker-max-leaves",
+        type=int,
+        default=32,
+        help="Max leaves to queue per breaker pass in target mode (0 = unlimited, default: 32)"
+    )
     parser.add_argument("--max-queries", type=int, default=0, help="Max API queries per cycle (0 = unlimited, default: 0)")
     parser.add_argument(
         "--skip-zero-cp",
@@ -2443,8 +2784,8 @@ def parse_arguments():
     parser.add_argument(
         "--poll-interval",
         type=int,
-        default=1,
-        help="Interval in seconds for polling task completion (default: 1s)"
+        default=5,
+        help="Interval in seconds for polling task completion (default: 5s)"
     )
     parser.add_argument(
         "--max-wait",
@@ -2704,6 +3045,9 @@ def main():
     branching_str = "Unlimited" if eff_defender_branching == 0 else str(eff_defender_branching)
     if args.strategy in ("target", "and_or"):
         print(f" Defender Br: {branching_str} max defensive tries per AND node")
+    if args.strategy == "target":
+        breaker_max_str = "Unlimited" if args.breaker_max_leaves == 0 else str(args.breaker_max_leaves)
+        print(f" Breaker Max: {breaker_max_str} leaves per breaker pass")
     print(f" Max Depth  : {depth_str} | No-Progress: {no_prog_str} | Max Leaves: {leaves_str}")
     print(f" 0 cp Filter: {'Active (skip 0 cp / draw)' if args.skip_zero_cp else 'Inactive'} | Min Score: {min_score_display}")
     print(f" Budget     : {b_label}")
@@ -2755,7 +3099,8 @@ def main():
                 budget=target_budget,
                 max_allowed_budget=max_allowed_budget,
                 dry_run=args.dry_run,
-                target_arg=args.target_score
+                target_arg=args.target_score,
+                breaker_max_leaves=args.breaker_max_leaves
             )
         else:
             logger.info("Starting reactive monitoring loop...")
@@ -2792,7 +3137,8 @@ def main():
                         budget=target_budget,
                         max_allowed_budget=max_allowed_budget,
                         dry_run=args.dry_run,
-                        target_arg=args.target_score
+                        target_arg=args.target_score,
+                        breaker_max_leaves=args.breaker_max_leaves
                     )
 
                     if explorer.strategy == "target" and explorer.target_score is not None and target_score != explorer.target_score:

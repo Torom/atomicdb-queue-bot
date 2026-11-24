@@ -21,7 +21,7 @@ Because leaves are submitted immediately as they are discovered during tree trav
 7. **Draw & 0 cp Filtering**: By default, avoids queuing draws and 0 cp perpetual check traps (`--skip-zero-cp`), focusing computing power on decisive advantages.
 8. **Reactive Daemon Mode (`--mode loop`)**: Rather than sleeping for fixed intervals, the daemon actively monitors submitted tasks. As soon as workers finish a task, the bot instantly re-traverses the updated tree.
 9. **Dynamic Minimax Updates**: As workers submit evaluations, values backpropagate through the database. The bot recalculates paths dynamically on each cycle, adapting immediately to refuted lines or deepened variations.
-10. **Saturation Breaker**: When the frontier saturates in target mode without finding open leaves, the bot executes an automated multi-stage breaker pass (escalating defender-branching to 2, starting with 0 cp margin if branching was 1, then escalating margin up to 10 cp), immediately reverting to base settings as soon as an unanalyzed leaf is queued.
+10. **Local Re-Backprop & Saturation Breaker**: When the frontier saturates in target mode without finding open leaves (e.g. due to deferred server backpropagation), the bot first performs a local in-memory negamax re-backpropagation across all cached nodes (up to 5 rounds, advancing the pass target locally if needed) and re-traverses at base settings. If still saturated and `--defender-branching > 0`, it runs a single `AND-width (def=unlimited)` pass at base margin (capped by `--breaker-max-leaves`), immediately reverting to base settings afterward.
 
 ---
 
@@ -78,7 +78,7 @@ uv run atomic_minimax_queue.py --max-leaves 2 --dry-run
 - **`--strategy target` (Default, Proof-Frontier / Record Breaking)**:
   Directly aims to break or achieve a target score (by default auto-fetched as `highest_score + 1` from `/atomicdb/api/roots`).
   The attacker (automatically determined from the root advantage, e.g. White even after `1. Nf3`, or explicitly set via `--attacker`) explores top winning candidates (OR nodes). The defender explores unrefuted defenses (AND nodes, up to `--defender-branching 2` by default) that hold the attacker below the target score, cutting off branches that already reach the target.
-  If the tree saturates without finding open leaves, the bot automatically executes a **saturation breaker** (escalating defender-branching to 2, testing 0 cp margin if branching was 1, then escalating margin from 1 cp up to 10 cp) to unblock frontier leaves, reverting to base settings as soon as a leaf is queued.
+  If the tree saturates without finding open leaves, the bot first runs a local in-memory negamax re-backpropagation over cached nodes to bypass deferred server backpropagation lag, and if still needed (when `--defender-branching > 0`) executes a single **saturation breaker** pass (`AND-width`, `def=unlimited` at base margin, capped by `--breaker-max-leaves`), reverting to base settings afterward.
   Once the target score is achieved in daemon mode, it logs success and automatically advances to the next record!
   ```bash
   # Auto-fetch record from API (e.g. +1255 cp) and queue all leaves needed to reach +1256 cp:
@@ -182,12 +182,13 @@ You can anchor the search at any line or defense variation:
 | `--defender-branching`| `2` | Max defensive moves per AND node (`2` [default], `0` = unlimited) |
 | `--max-depth` | `0` | Max search depth in plies (`0` = unlimited) |
 | `--max-leaves` | `0` | Max leaves to queue per cycle (`0` = unlimited) |
+| `--breaker-max-leaves` | `32` | Max leaves to queue per breaker pass in `target` mode (`0` = unlimited) |
 | `--max-queries` | `0` | Max API queries per cycle (`0` = unlimited) |
 | `--skip-zero-cp` | `True` | Skip 0 cp positions (draws / perpetuals) and do not queue them |
 | `--min-score` | `Auto` | Minimum score for attacker moves (`>= 1 cp` if winning, unrestricted if `<= 0 cp`) |
 | `--budget` | `128000000` | Node budget for analysis tasks (default: 128M) |
 | `--mode` | `loop` | Operating mode: `once` (single run) or `loop` (reactive daemon) |
-| `--poll-interval` | `1` | Polling interval in seconds to check task progress in loop mode |
+| `--poll-interval` | `5` | Polling interval in seconds to check task progress in loop mode |
 | `--max-wait` | `600` | Max wait time in seconds for active tasks before forcing a new cycle (`0` = unlimited) |
 | `--idle-interval` | `30` | Idle wait time in seconds if no tasks are active |
 | `--server` | `https://belzedar.duckdns.org/atomicdb` | AtomicDB base URL |
