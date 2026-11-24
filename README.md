@@ -6,7 +6,7 @@ An intelligent automation bot for the **[AtomicDB](https://belzedar.duckdns.org/
 
 ## Overview & How It Works
 
-The bot traverses the minimax / negamax game tree starting from a root position (by default, the standard atomic chess opening) and submits critical **leaf nodes live to the server queue** via the official AtomicDB API (`POST /atomicdb/api/request`).
+The bot traverses the minimax / negamax game tree starting from a root position (by default, the standard atomic chess opening) and submits critical **leaf nodes live to the server queue** via the official AtomicDB API (`POST /atomicdb/api/request-children` with `select`, falling back to `POST /atomicdb/api/request` for the root position).
 
 Because leaves are submitted immediately as they are discovered during tree traversal, server workers can start computing positions right away while the bot continues analyzing further branches.
 

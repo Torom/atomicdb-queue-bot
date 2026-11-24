@@ -14,7 +14,8 @@ How it works:
      * Attacker (White): Explores best winning attempt(s)
      * Defender (Black): Explores all unsolved defensive replies
 3. Prioritizes deeper leaves along the main line for maximum leverage on the minimax value.
-4. Queues discovered leaves live during traversal via the official AtomicDB API ('/atomicdb/api/request'),
+4. Queues discovered leaves live during traversal via the official AtomicDB API
+   ('/atomicdb/api/request-children' with 'select', falling back to '/atomicdb/api/request' for the root),
    logs the result, and continues searching seamlessly.
 5. Dynamically updates the minimax tree as new engine evaluations become available.
 """
@@ -68,6 +69,7 @@ except ImportError:
 # Default Server URL
 DEFAULT_SERVER = "https://belzedar.duckdns.org/atomicdb"
 DEFAULT_START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+REQUEST_CHILDREN_MAX_SELECT = 64
 
 logger = logging.getLogger("AtomicQueueBot")
 
@@ -162,57 +164,79 @@ def wrap_san_path(path_str: str, width: int = 120, indent_len: int = 11, max_col
             lines.append(cur)
         return lines or [path_str]
 
+    def _is_move_num_tok(tok: str) -> bool:
+        return bool(re.match(r'^\d+\.(?:\.\..*)?$', tok))
+
     cell_parts: List[Tuple[str, str]] = []
     i = 0
     while i < len(tokens):
-        if tokens[i].endswith("."):
-            if (
-                i + 2 < len(tokens)
-                and not tokens[i + 2].endswith(".")
-                and "..." not in tokens[i + 2]
-            ):
-                cell_parts.append((tokens[i], f"{tokens[i + 1]} {tokens[i + 2]}"))
+        tok = tokens[i]
+        m_white = re.match(r'^(\d+)\.$', tok)
+        m_black_joined = re.match(r'^(\d+)\.\.\.(.+)$', tok)
+        m_black_split = re.match(r'^(\d+)\.\.\.$', tok)
+        if m_white:
+            digits = m_white.group(1)
+            if i + 2 < len(tokens) and not _is_move_num_tok(tokens[i + 2]):
+                cell_parts.append((digits, f". {tokens[i + 1]} {tokens[i + 2]}"))
                 i += 3
-            elif i + 1 < len(tokens):
-                cell_parts.append((tokens[i], tokens[i + 1]))
+            elif i + 1 < len(tokens) and not _is_move_num_tok(tokens[i + 1]):
+                cell_parts.append((digits, f". {tokens[i + 1]}"))
                 i += 2
             else:
-                cell_parts.append((tokens[i], ""))
+                cell_parts.append((digits, "."))
+                i += 1
+        elif m_black_joined:
+            cell_parts.append((m_black_joined.group(1), f"...{m_black_joined.group(2)}"))
+            i += 1
+        elif m_black_split:
+            digits = m_black_split.group(1)
+            if i + 1 < len(tokens) and not _is_move_num_tok(tokens[i + 1]):
+                cell_parts.append((digits, f"... {tokens[i + 1]}"))
+                i += 2
+            else:
+                cell_parts.append((digits, "..."))
                 i += 1
         else:
-            cell_parts.append(("", tokens[i]))
+            cell_parts.append(("", tok))
             i += 1
 
-    raw_cells = [f"{num} {mv}".strip() if num else mv for num, mv in cell_parts]
+    raw_cells = [f"{digits}{rest}" for digits, rest in cell_parts]
     if len(raw_cells) <= max_cols and len(" ".join(raw_cells)) <= width - indent_len:
         return [" ".join(raw_cells)]
 
-    num_width = max((len(num) for num, _ in cell_parts if num), default=0)
-    cells = [
-        f"{num.rjust(num_width)} {mv}".rstrip() if num else mv
-        for num, mv in cell_parts
-    ]
-
-    chosen_cols = 1
-    chosen_widths = [max(len(c) for c in cells)]
-    for cols in range(min(max_cols, len(cells)), 0, -1):
-        rows = [cells[r:r + cols] for r in range(0, len(cells), cols)]
-        widths = [
-            max((len(row[c]) for row in rows if c < len(row)), default=0)
+    def _format_rows(cols: int) -> Tuple[List[List[str]], List[int]]:
+        raw_rows = [cell_parts[r:r + cols] for r in range(0, len(cell_parts), cols)]
+        digit_widths = [
+            max((len(row[c][0]) for row in raw_rows if c < len(row) and row[c][0]), default=0)
             for c in range(cols)
         ]
-        if indent_len + sum(widths) + 2 * (cols - 1) <= width:
-            chosen_cols = cols
-            chosen_widths = widths
+        formatted_rows = [
+            [
+                f"{digits.rjust(digit_widths[c])}{rest}" if digits else rest
+                for c, (digits, rest) in enumerate(row)
+            ]
+            for row in raw_rows
+        ]
+        col_widths = [
+            max((len(row[c]) for row in formatted_rows if c < len(row)), default=0)
+            for c in range(cols)
+        ]
+        return formatted_rows, col_widths
+
+    chosen_rows, chosen_widths = _format_rows(1)
+    for cols in range(min(max_cols, len(cell_parts)), 0, -1):
+        cand_rows, cand_widths = _format_rows(cols)
+        if indent_len + sum(cand_widths) + 2 * (cols - 1) <= width:
+            chosen_rows = cand_rows
+            chosen_widths = cand_widths
             break
 
-    rows = [cells[r:r + chosen_cols] for r in range(0, len(cells), chosen_cols)]
     return [
         "  ".join(
             cell.ljust(chosen_widths[c]) if c < len(row) - 1 else cell
             for c, cell in enumerate(row)
         )
-        for row in rows
+        for row in chosen_rows
     ]
 
 
@@ -374,6 +398,56 @@ class AtomicDBClient:
                 return {'status': 'http_error', 'code': resp.status_code, 'reason': resp.reason}
         except requests.RequestException as e:
             return {'status': 'error', 'reason': str(e)}
+
+    def request_children(
+        self,
+        fen: str,
+        select: List[str],
+        budget: Optional[int] = None,
+        only_if_missing: bool = True
+    ) -> dict:
+        """
+        Queues selected child moves of a parent position in one batch
+        (POST /atomicdb/api/request-children).
+        """
+        fen = canonicalize_fen(fen)
+        post_data = {
+            'fen': fen,
+            'select': ','.join(select),
+        }
+        if only_if_missing:
+            post_data['only_if_missing'] = '1'
+        if self.username and self.password:
+            post_data['username'] = self.username
+            post_data['password'] = self.password
+        if budget is not None:
+            post_data['budget'] = str(budget)
+
+        url = f"{self.base_url}/api/request-children"
+        retries = 3
+        while retries > 0:
+            self._rate_limit()
+            try:
+                resp = self.session.post(url, data=post_data, timeout=15)
+                if resp.status_code == 429 or (
+                    resp.status_code == 503 and 'Retry-After' in resp.headers
+                ):
+                    retry_after = int(resp.headers.get('Retry-After', '2'))
+                    logger.warning(
+                        f"HTTP {resp.status_code} ({resp.reason}) on request-children. "
+                        f"Waiting {retry_after}s..."
+                    )
+                    time.sleep(retry_after)
+                    retries -= 1
+                    continue
+                try:
+                    return resp.json()
+                except Exception:
+                    return {'status': 'http_error', 'code': resp.status_code, 'reason': resp.reason}
+            except requests.RequestException as e:
+                return {'status': 'error', 'reason': str(e)}
+
+        return {'status': 'http_error', 'code': 503, 'reason': 'max retries exceeded'}
 
     def my_queue(self) -> Optional[List[dict]]:
         """
@@ -552,15 +626,31 @@ class MinimaxFrontierExplorer:
         self.attacker_stm = attacker_stm  # 'w', 'b', or None (auto from root score)
         self.known_analyzed_fens: Set[str] = set()
 
+    @staticmethod
+    def _emit_leaves(
+        batch: List[LeafCandidate],
+        on_leaf: Optional[Callable[[LeafCandidate], None]],
+        on_leaves: Optional[Callable[[List[LeafCandidate]], None]],
+    ) -> None:
+        """Dispatches a discovered leaf batch to `on_leaves` or falls back to `on_leaf`."""
+        if not batch:
+            return
+        if on_leaves:
+            on_leaves(batch)
+        elif on_leaf:
+            for leaf in batch:
+                on_leaf(leaf)
+
     def explore(
         self,
         root_fen: str,
-        on_leaf: Optional[Callable[[LeafCandidate], None]] = None
+        on_leaf: Optional[Callable[[LeafCandidate], None]] = None,
+        on_leaves: Optional[Callable[[List[LeafCandidate]], None]] = None,
     ) -> List[LeafCandidate]:
         """
         Executes a Best-First / Priority-Queue search starting from root_fen.
-        If on_leaf is provided, each discovered leaf node is immediately passed
-        to this callback (e.g. for live queuing and logging).
+        If on_leaves (or on_leaf) is provided, discovered leaf nodes are immediately
+        passed to this callback (e.g. for live batch queuing and logging).
         Returns prioritized LeafCandidate objects.
         """
         root_fen = canonicalize_fen(root_fen)
@@ -584,8 +674,8 @@ class MinimaxFrontierExplorer:
         min_score_initialized = (self.min_score is not None)
 
         # Frontier node tuple:
-        # (priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth)
-        initial_nodes = [(0.0, 0, [], {root_fen}, root_fen, True, 0, 0)]
+        # (priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth, parent_fen)
+        initial_nodes = [(0.0, 0, [], {root_fen}, root_fen, True, 0, 0, "")]
         leaves, effective_min_score, min_score_initialized = self._traverse_frontier(
             initial_nodes=initial_nodes,
             root_stm=root_stm,
@@ -597,6 +687,7 @@ class MinimaxFrontierExplorer:
             cycle_attacker_events=cycle_attacker_events,
             no_progress_events=no_progress_events,
             on_leaf=on_leaf,
+            on_leaves=on_leaves,
             max_leaves_limit=self.max_leaves
         )
 
@@ -617,6 +708,7 @@ class MinimaxFrontierExplorer:
                     visited_nodes=visited_nodes,
                     no_progress_events=no_progress_events,
                     on_leaf=on_leaf,
+                    on_leaves=on_leaves,
                     max_leaves_remaining=remaining_leaves
                 )
                 leaves.extend(progress_leaves)
@@ -670,6 +762,7 @@ class MinimaxFrontierExplorer:
 
             if candidate_exits:
                 candidate_exits.sort(key=lambda x: x[0], reverse=True)
+                exit_groups: Dict[Optional[str], List[LeafCandidate]] = {}
                 for _, depth_val, path_val, cand_fen, m_dict, parent_fen_val in candidate_exits[:max_recovery]:
                     if cand_fen not in seen_leaves:
                         seen_leaves.add(cand_fen)
@@ -683,8 +776,10 @@ class MinimaxFrontierExplorer:
                             priority=-depth_val * 1000.0
                         )
                         leaves.append(leaf)
-                        if on_leaf:
-                            on_leaf(leaf)
+                        exit_groups.setdefault(parent_fen_val, []).append(leaf)
+
+                for group in exit_groups.values():
+                    self._emit_leaves(group, on_leaf, on_leaves)
 
                 if leaves:
                     logger.info(
@@ -715,7 +810,7 @@ class MinimaxFrontierExplorer:
 
     def _traverse_frontier(
         self,
-        initial_nodes: List[Tuple[float, int, List[str], Set[str], str, bool, int, int]],
+        initial_nodes: List[Tuple[float, int, List[str], Set[str], str, bool, int, int, str]],
         root_stm: str,
         attacker_stm: str,
         effective_min_score: Optional[int],
@@ -725,12 +820,13 @@ class MinimaxFrontierExplorer:
         cycle_attacker_events: List[Tuple[int, List[str]]],
         no_progress_events: List[Tuple[int, int, List[str], bool]],
         on_leaf: Optional[Callable[[LeafCandidate], None]] = None,
+        on_leaves: Optional[Callable[[List[LeafCandidate]], None]] = None,
         max_leaves_limit: int = 0
     ) -> Tuple[List[LeafCandidate], Optional[int], bool]:
         """Executes priority-queue minimax traversal from initial_nodes and returns discovered leaves."""
         attacker_parity = 0 if attacker_stm == root_stm else 1
         leaves: List[LeafCandidate] = []
-        frontier: List[Tuple[float, int, List[str], Set[str], str, bool, int, int]] = []
+        frontier: List[Tuple[float, int, List[str], Set[str], str, bool, int, int, str]] = []
         for node in initial_nodes:
             heappush(frontier, node)
 
@@ -753,7 +849,7 @@ class MinimaxFrontierExplorer:
                     f"Open nodes: {len(frontier)}"
                 )
 
-            priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth = heappop(frontier)
+            priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth, parent_fen_str = heappop(frontier)
 
             if self.max_depth > 0 and depth > self.max_depth:
                 continue
@@ -776,11 +872,11 @@ class MinimaxFrontierExplorer:
                         depth=depth,
                         score=None,
                         reason='not_in_db',
+                        parent_fen=parent_fen_str or None,
                         priority=priority
                     )
                     leaves.append(leaf)
-                    if on_leaf:
-                        on_leaf(leaf)
+                    self._emit_leaves([leaf], on_leaf, on_leaves)
                 continue
 
             status = data.get('status', 'UNKNOWN')
@@ -842,11 +938,11 @@ class MinimaxFrontierExplorer:
                         depth=depth,
                         score=node_score,
                         reason='zero_visits',
+                        parent_fen=parent_fen_str or None,
                         priority=priority
                     )
                     leaves.append(leaf)
-                    if on_leaf:
-                        on_leaf(leaf)
+                    self._emit_leaves([leaf], on_leaf, on_leaves)
                 continue
 
             if not moves:
@@ -1054,6 +1150,7 @@ class MinimaxFrontierExplorer:
                             f"Repetition at depth {depth}: Attacker has no non-cyclic exits left -> branch discarded."
                         )
 
+            node_leaves: List[LeafCandidate] = []
             for m, child_fen, new_no_progress, new_last_prog_depth in valid_candidates:
                 uci = m['uci']
                 move_visits = self._resolve_effective_visits(m, child_fen)
@@ -1111,6 +1208,8 @@ class MinimaxFrontierExplorer:
                             continue
 
                     if child_fen not in seen_leaves:
+                        if max_leaves_limit > 0 and len(leaves) >= max_leaves_limit:
+                            break
                         seen_leaves.add(child_fen)
                         if m.get('_is_cycle_exit'):
                             reason_str = 'cycle_exit'
@@ -1128,13 +1227,14 @@ class MinimaxFrontierExplorer:
                             priority=child_priority
                         )
                         leaves.append(leaf)
-                        if on_leaf:
-                            on_leaf(leaf)
+                        node_leaves.append(leaf)
                 else:
                     heappush(
                         frontier,
-                        (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv, new_no_progress, new_last_prog_depth)
+                        (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv, new_no_progress, new_last_prog_depth, fen)
                     )
+
+            self._emit_leaves(node_leaves, on_leaf, on_leaves)
 
         return leaves, effective_min_score, min_score_initialized
 
@@ -1148,6 +1248,7 @@ class MinimaxFrontierExplorer:
         visited_nodes: Set[str],
         no_progress_events: List[Tuple[int, int, List[str], bool]],
         on_leaf: Optional[Callable[[LeafCandidate], None]] = None,
+        on_leaves: Optional[Callable[[List[LeafCandidate]], None]] = None,
         max_leaves_remaining: int = 0
     ) -> List[LeafCandidate]:
         """
@@ -1275,6 +1376,7 @@ class MinimaxFrontierExplorer:
             max_recovery = min(max_recovery, max_leaves_remaining)
 
         recovered: List[LeafCandidate] = []
+        unvisited_batch: List[LeafCandidate] = []
         unvisited_anchor: Optional[Tuple[int, int]] = None
 
         for _sk, tier, att_depth, last_prog_depth, att_path, att_path_fens, att_fen, m_dict, cand_fen, m_visits, is_prog, m_san in candidates:
@@ -1301,8 +1403,7 @@ class MinimaxFrontierExplorer:
                     priority=-(att_depth + 1) * 1000.0
                 )
                 recovered.append(leaf)
-                if on_leaf:
-                    on_leaf(leaf)
+                unvisited_batch.append(leaf)
             else:
                 if recovered:
                     break
@@ -1320,7 +1421,8 @@ class MinimaxFrontierExplorer:
                     cand_fen,
                     True,
                     next_no_prog,
-                    next_last_prog
+                    next_last_prog,
+                    att_fen
                 )]
                 rem = (max_leaves_remaining - len(recovered)) if max_leaves_remaining > 0 else 0
                 sub_leaves, _, _ = self._traverse_frontier(
@@ -1334,6 +1436,7 @@ class MinimaxFrontierExplorer:
                     cycle_attacker_events=[],
                     no_progress_events=[],
                     on_leaf=on_leaf,
+                    on_leaves=on_leaves,
                     max_leaves_limit=rem
                 )
                 if sub_leaves:
@@ -1343,6 +1446,8 @@ class MinimaxFrontierExplorer:
                         f"(score {m_dict.get('score')} cp, Tier {tier}) yielded {len(sub_leaves)} leaf/leaves."
                     )
                     break
+
+        self._emit_leaves(unvisited_batch, on_leaf, on_leaves)
 
         if recovered and unvisited_anchor is not None:
             logger.info(
@@ -1586,15 +1691,8 @@ def run_cycle(
     leaf_idx = 0
     already_analyzed_count = 0
 
-    def handle_leaf(leaf: LeafCandidate) -> None:
-        nonlocal queued_count, leaf_idx, already_analyzed_count
-        if max_queue and max_queue > 0 and queued_count >= max_queue:
-            return
-
-        if explorer.skip_zero_cp and leaf.score is not None and leaf.score == 0:
-            logger.info(f"Skipping 0 cp leaf ({leaf.fen}).")
-            return
-
+    def emit_leaf_header(leaf: LeafCandidate) -> None:
+        nonlocal leaf_idx
         leaf_idx += 1
         score_str = f"{leaf.score:+d} cp" if leaf.score is not None else "N/A"
         path_str = format_path_san(root_fen, leaf.path)
@@ -1609,10 +1707,38 @@ def run_cycle(
             print(f"           {p_line}")
         print(f"     FEN : {leaf.fen}")
 
-        if dry_run:
-            queued_count += 1
-            print(f"     [DRY-RUN] Would queue: {leaf.fen}\n")
+    def format_extra(
+        task_id: Optional[int] = None,
+        task_state: Optional[str] = None,
+        budget_nodes: Optional[int] = None,
+        ahead: object = '',
+        reason: str = '',
+        backed: bool = False,
+    ) -> str:
+        extra = []
+        if task_id:
+            extra.append(f"Task #{task_id}")
+        if task_state:
+            extra.append(f"Status: {task_state}")
+        if budget_nodes:
+            extra.append(format_budget(budget_nodes))
+        if ahead != '':
+            extra.append(f"Queue pos: {ahead}")
+        if backed:
+            extra.append("backed")
+        if reason:
+            r_clean = reason.replace("this address already has a live request on this position; wait for it to land", "live request active")
+            if len(r_clean) > 30:
+                r_clean = r_clean[:27] + "..."
+            extra.append(f"Reason: {r_clean}")
+        return f" ({', '.join(extra)})" if extra else ""
+
+    def handle_single_request(leaf: LeafCandidate) -> None:
+        nonlocal queued_count, already_analyzed_count
+        if max_queue and max_queue > 0 and queued_count >= max_queue:
             return
+
+        emit_leaf_header(leaf)
 
         resp = client.request_analysis(leaf.fen, budget=budget)
         status = resp.get('status', 'unknown')
@@ -1633,7 +1759,7 @@ def run_cycle(
             return
 
         # Emergency safety net AFTER request:
-        # If the server unexpectedly assigns more than the allowed budget (> 128M),
+        # If the server unexpectedly assigns more than the allowed budget (> max_allowed_budget),
         # cancel the task immediately!
         if budget_nodes and budget_nodes > max_allowed_budget:
             b_str = format_budget(budget_nodes)
@@ -1653,22 +1779,13 @@ def run_cycle(
                 )
                 return
 
-        extra = []
-        if task_id:
-            extra.append(f"Task #{task_id}")
-        if task_state:
-            extra.append(f"Status: {task_state}")
-        if budget_nodes:
-            extra.append(format_budget(budget_nodes))
-        if ahead != '':
-            extra.append(f"Queue pos: {ahead}")
-        if reason:
-            r_clean = reason.replace("this address already has a live request on this position; wait for it to land", "live request active")
-            if len(r_clean) > 30:
-                r_clean = r_clean[:27] + "..."
-            extra.append(f"Reason: {r_clean}")
-        extra_str = f" ({', '.join(extra)})" if extra else ""
-
+        extra_str = format_extra(
+            task_id=task_id,
+            task_state=task_state,
+            budget_nodes=budget_nodes,
+            ahead=ahead,
+            reason=reason,
+        )
         print(f"     --> Status: {status:<15}{extra_str}\n")
         if status in ('queued', 'already-queued', 'already-requested', 'expanded'):
             queued_count += 1
@@ -1680,7 +1797,165 @@ def run_cycle(
                 'path': leaf.path
             })
 
-    leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
+    def handle_leaves(batch: List[LeafCandidate]) -> None:
+        nonlocal queued_count, already_analyzed_count
+        if max_queue and max_queue > 0 and queued_count >= max_queue:
+            return
+
+        filtered: List[LeafCandidate] = []
+        for leaf in batch:
+            if explorer.skip_zero_cp and leaf.score is not None and leaf.score == 0:
+                logger.info(f"Skipping 0 cp leaf ({leaf.fen}).")
+                continue
+            filtered.append(leaf)
+
+        if not filtered:
+            return
+
+        if dry_run:
+            for leaf in filtered:
+                if max_queue and max_queue > 0 and queued_count >= max_queue:
+                    break
+                emit_leaf_header(leaf)
+                queued_count += 1
+                print(f"     [DRY-RUN] Would queue: {leaf.fen}\n")
+            return
+
+        singles: List[LeafCandidate] = []
+        by_parent: Dict[str, List[LeafCandidate]] = {}
+        for leaf in filtered:
+            if leaf.parent_fen and leaf.path:
+                by_parent.setdefault(leaf.parent_fen, []).append(leaf)
+            else:
+                singles.append(leaf)
+
+        for leaf in singles:
+            if max_queue and max_queue > 0 and queued_count >= max_queue:
+                return
+            handle_single_request(leaf)
+
+        for parent_fen, parent_leaves in by_parent.items():
+            idx = 0
+            while idx < len(parent_leaves):
+                if max_queue and max_queue > 0:
+                    remaining = max_queue - queued_count
+                    if remaining <= 0:
+                        return
+                    chunk_size = min(REQUEST_CHILDREN_MAX_SELECT, remaining)
+                else:
+                    chunk_size = REQUEST_CHILDREN_MAX_SELECT
+
+                chunk = parent_leaves[idx:idx + chunk_size]
+                idx += len(chunk)
+
+                select_ucis = [l.path[-1].lower() for l in chunk]
+                resp = client.request_children(
+                    parent_fen,
+                    select=select_ucis,
+                    budget=budget,
+                    only_if_missing=True,
+                )
+                top_status = resp.get('status', 'unknown')
+                top_reason = resp.get('reason', '')
+                queued_list = resp.get('queued')
+                skipped_list = resp.get('skipped')
+
+                if (
+                    top_status in ('refused', 'queue-full-account', 'http_error', 'error', 'already-solved')
+                    or not isinstance(queued_list, list)
+                    or not isinstance(skipped_list, list)
+                ):
+                    extra_str = format_extra(reason=top_reason)
+                    for leaf in chunk:
+                        emit_leaf_header(leaf)
+                        if top_status == 'already-solved':
+                            explorer.known_analyzed_fens.add(leaf.fen)
+                            already_analyzed_count += 1
+                        print(f"     --> Status: {top_status:<15}{extra_str}\n")
+                    continue
+
+                queued_by_move = {
+                    e['move'].lower(): e
+                    for e in queued_list
+                    if isinstance(e, dict) and e.get('move')
+                }
+                skipped_by_move = {
+                    e['move'].lower(): e
+                    for e in skipped_list
+                    if isinstance(e, dict) and e.get('move')
+                }
+
+                for leaf in chunk:
+                    emit_leaf_header(leaf)
+                    uci = leaf.path[-1].lower()
+
+                    if uci in queued_by_move:
+                        entry = queued_by_move[uci]
+                        task_id = entry.get('task')
+                        key = entry.get('key') or key_of(leaf.fen)
+                        budget_nodes = entry.get('budget_nodes')
+
+                        if budget_nodes and budget_nodes > max_allowed_budget:
+                            b_str = format_budget(budget_nodes)
+                            max_str = format_budget(max_allowed_budget)
+                            if task_id:
+                                cancel_resp = client.cancel_task(task_id)
+                                cancel_st = cancel_resp.get('status', 'unknown')
+                                print(
+                                    f"     --> [CANCELLED] Server assigned {b_str} nodes (> {max_str}). "
+                                    f"Task #{task_id} cancelled immediately ({cancel_st})!\n"
+                                )
+                            else:
+                                print(
+                                    f"     --> [IGNORED] Server assigned {b_str} nodes (> {max_str}). "
+                                    f"Not tracking.\n"
+                                )
+                            continue
+
+                        extra_str = format_extra(task_id=task_id, budget_nodes=budget_nodes)
+                        print(f"     --> Status: {'queued':<15}{extra_str}\n")
+                        queued_count += 1
+                        tracked_tasks.append({
+                            'fen': leaf.fen,
+                            'key': key,
+                            'task_id': task_id,
+                            'status': 'queued',
+                            'path': leaf.path
+                        })
+                    elif uci in skipped_by_move:
+                        entry = skipped_by_move[uci]
+                        st = entry.get('reason', 'skipped')
+                        if st in ('already-analyzed', 'closed', 'already-solved', 'ladder-spent'):
+                            explorer.known_analyzed_fens.add(leaf.fen)
+                            already_analyzed_count += 1
+                            completed_budget = entry.get('completed_budget')
+                            if completed_budget:
+                                b_label = format_budget(completed_budget)
+                                print(f"     --> Status: {st} (already analyzed with {b_label} nodes)\n")
+                            else:
+                                print(f"     --> Status: {st}\n")
+                        elif st in ('already-queued', 'already-requested'):
+                            task_id = entry.get('task')
+                            key = entry.get('key') or key_of(leaf.fen)
+                            extra_str = format_extra(
+                                task_id=task_id,
+                                backed=bool(entry.get('backed', False)),
+                            )
+                            print(f"     --> Status: {st:<15}{extra_str}\n")
+                            queued_count += 1
+                            tracked_tasks.append({
+                                'fen': leaf.fen,
+                                'key': key,
+                                'task_id': task_id,
+                                'status': st,
+                                'path': leaf.path
+                            })
+                        else:
+                            print(f"     --> Status: {st:<15}\n")
+                    else:
+                        print(f"     --> Status: {top_status:<15}\n")
+
+    leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
 
     print("=" * 78)
     if not leaves or queued_count == 0:
@@ -1723,7 +1998,7 @@ def run_cycle(
                     client.query_count = 0
                     queued_before_breaker = queued_count
                     analyzed_before_breaker = already_analyzed_count
-                    breaker_leaves = explorer.explore(root_fen, on_leaf=handle_leaf)
+                    breaker_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
                     print("=" * 78)
                     breaker_queued = queued_count - queued_before_breaker
                     breaker_analyzed = already_analyzed_count - analyzed_before_breaker
@@ -2144,7 +2419,7 @@ def parse_arguments():
         "--budget",
         type=int,
         default=None,
-        choices=[128000000, 512000000, 2000000000, 10000000000],
+        choices=[128000000, 512000000, 2000000000],
         help="Node budget (default: 128000000. Larger budgets like 512000000 or 2000000000 only when explicitly specified)."
     )
     parser.add_argument(
