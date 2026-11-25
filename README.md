@@ -190,7 +190,7 @@ You can anchor the search at any line or defense variation:
 | `--mode` | `loop` | Operating mode: `once` (single run) or `loop` (reactive daemon) |
 | `--poll-interval` | `5` | Polling interval in seconds to check task progress in loop mode |
 | `--max-wait` | `600` | Max wait time in seconds for active tasks before forcing a new cycle (`0` = unlimited) |
-| `--idle-interval` | `30` | Idle wait time in seconds if no tasks are active |
+| `--idle-interval` | `5` | Idle wait time in seconds if no tasks are active |
 | `--server` | `https://belzedar.duckdns.org/atomicdb` | AtomicDB base URL |
 | `-U`, `--username` | `""` | OpenBench username (or `ATOMICDB_USER` via env / `.env`) |
 | `-P`, `--password` | `""` | OpenBench password (or `ATOMICDB_PASSWORD` via env / `.env`) |

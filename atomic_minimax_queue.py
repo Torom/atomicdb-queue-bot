@@ -2925,8 +2925,8 @@ def parse_arguments():
     parser.add_argument(
         "--idle-interval",
         type=int,
-        default=30,
-        help="Wait time in seconds if no tasks are active or during dry run (default: 30s)"
+        default=5,
+        help="Wait time in seconds if no tasks are active or during dry run (default: 5s)"
     )
     return parser.parse_args()
 
