@@ -661,8 +661,10 @@ class MinimaxFrontierExplorer:
         Recomputes negamax scores/statuses bottom-up across all nodes currently
         in `self.client.cache` so fresh leaf evaluations propagate locally even
         when the server's deferred propagation queue lags behind.
-        When `root_fen` is provided, excludes backward/cross cycle edges
-        (`depth(child) <= depth(parent)`) to avoid repetition echo loops.
+        When `root_fen` is provided, computes SCCs and excludes true cycle
+        back/cross edges (`scc_id(child) == scc_id(parent)` and
+        `depth(child) <= depth(parent)`) to avoid repetition echo loops while
+        still propagating across acyclic DAG transpositions.
         Returns the number of parent nodes whose score/best_move/status changed.
         """
         cache = self.client.cache
@@ -732,6 +734,56 @@ class MinimaxFrontierExplorer:
                             depth_from_root[ch_f] = cur_d + 1
                             bfs.append(ch_f)
 
+        scc_id: Dict[str, int] = {}
+        if depth_from_root:
+            index_map: Dict[str, int] = {}
+            lowlink: Dict[str, int] = {}
+            on_stack: Set[str] = set()
+            tarjan_stack: List[str] = []
+            next_idx = 0
+            next_scc = 0
+
+            for start_fen in depth_from_root:
+                if start_fen in index_map:
+                    continue
+                call_stack: List[Tuple[str, int]] = [(start_fen, 0)]
+                index_map[start_fen] = lowlink[start_fen] = next_idx
+                next_idx += 1
+                tarjan_stack.append(start_fen)
+                on_stack.add(start_fen)
+
+                while call_stack:
+                    v, edge_pos = call_stack[-1]
+                    v_edges = raw_edges.get(v, ())
+                    if edge_pos < len(v_edges):
+                        call_stack[-1] = (v, edge_pos + 1)
+                        w = v_edges[edge_pos][2]
+                        if w not in depth_from_root:
+                            continue
+                        if w not in index_map:
+                            index_map[w] = lowlink[w] = next_idx
+                            next_idx += 1
+                            tarjan_stack.append(w)
+                            on_stack.add(w)
+                            call_stack.append((w, 0))
+                        elif w in on_stack and index_map[w] < lowlink[v]:
+                            lowlink[v] = index_map[w]
+                    else:
+                        call_stack.pop()
+                        if call_stack:
+                            parent_v = call_stack[-1][0]
+                            if lowlink[v] < lowlink[parent_v]:
+                                lowlink[parent_v] = lowlink[v]
+                        if lowlink[v] == index_map[v]:
+                            cid = next_scc
+                            next_scc += 1
+                            while True:
+                                w = tarjan_stack.pop()
+                                on_stack.remove(w)
+                                scc_id[w] = cid
+                                if w == v:
+                                    break
+
         graph: Dict[str, List[Tuple[int, str, str]]] = {}
         back_edge_ucis: Dict[str, Set[str]] = {}
         for fen, edges_list in raw_edges.items():
@@ -739,9 +791,16 @@ class MinimaxFrontierExplorer:
             if parent_d is not None:
                 fwd_edges: List[Tuple[int, str, str]] = []
                 back_ucis: Set[str] = set()
+                parent_scc = scc_id.get(fen)
                 for item in edges_list:
-                    child_d = depth_from_root.get(item[2])
-                    if child_d is not None and child_d <= parent_d:
+                    child_fen = item[2]
+                    child_d = depth_from_root.get(child_fen)
+                    if (
+                        child_d is not None
+                        and child_d <= parent_d
+                        and parent_scc is not None
+                        and parent_scc == scc_id.get(child_fen)
+                    ):
                         back_ucis.add(item[1])
                     else:
                         fwd_edges.append(item)
@@ -1456,10 +1515,16 @@ class MinimaxFrontierExplorer:
                     if self.strategy == "target" and self.target_score is not None and move_score is not None:
                         # 1. Defender (stm != attacker_stm) made the move to this leaf: Attacker score is -move_score.
                         # If Attacker already achieves target score (move_score <= -self.target_score), Defender is
-                        # refuted here! We never queue Defender moves that already concede the target score (even if borrowed).
+                        # normally refuted here. However, if the parent node's own score is still > -target_score
+                        # and this is the parent's unconfirmed best_move (visits == 0), we must search it so the
+                        # server updates the parent/root score!
                         # Note: The margin_cp only applies on the way down the tree (in _select_moves), not to leaves!
                         if stm != attacker_stm and move_score <= -self.target_score:
-                            continue
+                            if not (
+                                is_primary_pv
+                                and (node_score is None or node_score > -self.target_score)
+                            ):
+                                continue
 
                         # 2. Attacker (stm == attacker_stm) made the move to this leaf: Attacker score is move_score.
                         # Only prune a move that meets target if this parent node already accepts >= target_score
@@ -1879,6 +1944,19 @@ class MinimaxFrontierExplorer:
                     if bm_m and bm_m not in candidates:
                         candidates.append(bm_m)
 
+                if not candidates and best_move and (node_score is None or node_score > -target):
+                    bm_fallback = next(
+                        (
+                            m for m in scored_moves
+                            if m['uci'] == best_move
+                            and m.get('status') == 'UNKNOWN'
+                            and m.get('visits', 0) == 0
+                        ),
+                        None,
+                    )
+                    if bm_fallback:
+                        candidates.append(bm_fallback)
+
                 if not candidates:
                     return []
 
@@ -2279,7 +2357,7 @@ def run_cycle(
             canon_root = canonicalize_fen(root_fen)
             root_stm = canon_root.split()[1] if len(canon_root.split()) > 1 else 'w'
 
-            def _maybe_advance_local_target(log_prefix: str = "[RE-BACKPROP]") -> None:
+            def _maybe_advance_local_target(log_prefix: str = "[RE-BACKPROP]") -> bool:
                 root_cached = client.cache.get(canon_root)
                 local_raw = root_cached.get('score') if root_cached else None
                 eff_att = (
@@ -2295,10 +2373,36 @@ def run_cycle(
                         f"{log_prefix} Local root score reached {local_att:+d} cp "
                         f"(>= target {prev_target:+d} cp); advancing pass target locally to {local_target:+d} cp."
                     )
+                    return True
+                return False
+
+            def _run_rebackprop_pass(log_msg: str) -> int:
+                logger.info(log_msg)
+                client.query_count = 0
+                queued_before_re = queued_count
+                analyzed_before_re = already_analyzed_count
+                re_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
+                print("=" * 78)
+                re_queued = queued_count - queued_before_re
+                re_analyzed = already_analyzed_count - analyzed_before_re
+                if re_queued > 0:
+                    extra_info = [f"{re_queued} queued"]
+                    if re_analyzed > 0:
+                        extra_info.append(f"{re_analyzed} already analyzed")
+                    logger.info(
+                        f"[RE-BACKPROP] Traversal complete: {len(re_leaves)} leaves found, "
+                        f"{', '.join(extra_info)} ({client.query_count} queries)."
+                    )
+                else:
+                    logger.info(
+                        f"[RE-BACKPROP] No leaves queued ({len(re_leaves)} found, "
+                        f"{re_analyzed} already analyzed, {client.query_count} queries)."
+                    )
+                return re_queued
 
             try:
                 # 1. Local In-Memory Re-Backprop across cached nodes before escalating:
-                for _re_round in range(5):
+                for _re_round in range(10):
                     updated_nodes = explorer.rebackprop_cache(root_fen)
                     if updated_nodes <= 0:
                         break
@@ -2307,26 +2411,10 @@ def run_cycle(
                         f"re-traversing at base settings..."
                     )
                     _maybe_advance_local_target("[RE-BACKPROP]")
-                    client.query_count = 0
-                    queued_before_re = queued_count
-                    analyzed_before_re = already_analyzed_count
-                    re_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
-                    print("=" * 78)
-                    re_queued = queued_count - queued_before_re
-                    re_analyzed = already_analyzed_count - analyzed_before_re
-                    if re_queued > 0:
-                        extra_info = [f"{re_queued} queued"]
-                        if re_analyzed > 0:
-                            extra_info.append(f"{re_analyzed} already analyzed")
-                        logger.info(
-                            f"[RE-BACKPROP] Traversal complete: {len(re_leaves)} leaves found, "
-                            f"{', '.join(extra_info)} ({client.query_count} queries)."
-                        )
+                    if _run_rebackprop_pass(
+                        f"[RE-BACKPROP] Exploring at {explorer.target_score:+d} cp (def-branch: {explorer.defender_branching})..."
+                    ) > 0:
                         break
-                    logger.info(
-                        f"[RE-BACKPROP] No leaves queued ({len(re_leaves)} found, "
-                        f"{re_analyzed} already analyzed, {client.query_count} queries)."
-                    )
 
                 if queued_count == 0 and explorer.defender_branching > 0:
                     orig_branching = explorer.defender_branching
@@ -2359,38 +2447,43 @@ def run_cycle(
                             )
                         else:
                             explorer.rebackprop_cache(root_fen)
-                            _maybe_advance_local_target("[BREAKER]")
-                            logger.info(
-                                f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
-                                f"Trying {stage_label} "
-                                f"(max leaves: {breaker_limit if breaker_limit > 0 else 'unlimited'})..."
-                            )
-                            explorer.defender_branching = 0
-                            explorer.max_leaves = breaker_limit
-                            current_max_queue = breaker_limit
-                            client.query_count = 0
-                            queued_before_breaker = queued_count
-                            analyzed_before_breaker = already_analyzed_count
-                            breaker_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
-                            print("=" * 78)
-                            breaker_queued = queued_count - queued_before_breaker
-                            breaker_analyzed = already_analyzed_count - analyzed_before_breaker
+                            if _maybe_advance_local_target("[RE-BACKPROP]"):
+                                _run_rebackprop_pass(
+                                    f"[RE-BACKPROP] Re-traversing at new local target {explorer.target_score:+d} cp "
+                                    f"with base settings (def-branch: {orig_branching})..."
+                                )
+                            if queued_count == 0:
+                                logger.info(
+                                    f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
+                                    f"Trying {stage_label} "
+                                    f"(max leaves: {breaker_limit if breaker_limit > 0 else 'unlimited'})..."
+                                )
+                                explorer.defender_branching = 0
+                                explorer.max_leaves = breaker_limit
+                                current_max_queue = breaker_limit
+                                client.query_count = 0
+                                queued_before_breaker = queued_count
+                                analyzed_before_breaker = already_analyzed_count
+                                breaker_leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
+                                print("=" * 78)
+                                breaker_queued = queued_count - queued_before_breaker
+                                breaker_analyzed = already_analyzed_count - analyzed_before_breaker
 
-                            if breaker_queued > 0:
-                                extra_info = [f"{breaker_queued} queued"]
-                                if breaker_analyzed > 0:
-                                    extra_info.append(f"{breaker_analyzed} already analyzed")
-                                summary_str = ", ".join(extra_info)
-                                logger.info(
-                                    f"[BREAKER] Traversal complete ({stage_label}): {len(breaker_leaves)} leaves found, "
-                                    f"{summary_str} ({client.query_count} queries)."
-                                )
-                            elif not breaker_leaves:
-                                logger.info(f"[BREAKER] No open leaf nodes found ({stage_label}).")
-                            else:
-                                logger.info(
-                                    f"[BREAKER] No leaves queued ({len(breaker_leaves)} found, 0 queued at {stage_label})."
-                                )
+                                if breaker_queued > 0:
+                                    extra_info = [f"{breaker_queued} queued"]
+                                    if breaker_analyzed > 0:
+                                        extra_info.append(f"{breaker_analyzed} already analyzed")
+                                    summary_str = ", ".join(extra_info)
+                                    logger.info(
+                                        f"[BREAKER] Traversal complete ({stage_label}): {len(breaker_leaves)} leaves found, "
+                                        f"{summary_str} ({client.query_count} queries)."
+                                    )
+                                elif not breaker_leaves:
+                                    logger.info(f"[BREAKER] No open leaf nodes found ({stage_label}).")
+                                else:
+                                    logger.info(
+                                        f"[BREAKER] No leaves queued ({len(breaker_leaves)} found, 0 queued at {stage_label})."
+                                    )
                     finally:
                         explorer.defender_branching = orig_branching
                         explorer.max_leaves = orig_max_leaves
