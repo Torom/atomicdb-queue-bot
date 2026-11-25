@@ -430,10 +430,24 @@ class AtomicDBClient:
             self._rate_limit()
             try:
                 resp = self.session.post(url, data=post_data, timeout=15)
+                data = None
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = None
+
+                # PR #313: queue-full-account returns HTTP 429 with Retry-After: 300;
+                # return it immediately as an application status instead of sleeping/retrying.
+                if isinstance(data, dict) and data.get('status') in ('queue-full-account', 'queue-full'):
+                    return data
+
                 if resp.status_code == 429 or (
                     resp.status_code == 503 and 'Retry-After' in resp.headers
                 ):
-                    retry_after = int(resp.headers.get('Retry-After', '2'))
+                    try:
+                        retry_after = int(resp.headers.get('Retry-After', '2'))
+                    except ValueError:
+                        retry_after = 2
                     logger.warning(
                         f"HTTP {resp.status_code} ({resp.reason}) on request-children. "
                         f"Waiting {retry_after}s..."
@@ -441,10 +455,10 @@ class AtomicDBClient:
                     time.sleep(retry_after)
                     retries -= 1
                     continue
-                try:
-                    return resp.json()
-                except Exception:
-                    return {'status': 'http_error', 'code': resp.status_code, 'reason': resp.reason}
+
+                if data is not None:
+                    return data
+                return {'status': 'http_error', 'code': resp.status_code, 'reason': resp.reason}
             except requests.RequestException as e:
                 return {'status': 'error', 'reason': str(e)}
 
@@ -1943,6 +1957,7 @@ def run_cycle(
     queued_count = 0
     leaf_idx = 0
     already_analyzed_count = 0
+    account_queue_full = False
     current_max_queue = max_queue
 
     def emit_leaf_header(leaf: LeafCandidate) -> None:
@@ -1988,7 +2003,9 @@ def run_cycle(
         return f" ({', '.join(extra)})" if extra else ""
 
     def handle_single_request(leaf: LeafCandidate) -> None:
-        nonlocal queued_count, already_analyzed_count
+        nonlocal queued_count, already_analyzed_count, account_queue_full
+        if account_queue_full:
+            return
         if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
             return
 
@@ -2042,6 +2059,9 @@ def run_cycle(
             reason=reason,
         )
         print(f"     --> Status: {status:<15}{extra_str}\n")
+        if status in ('queue-full-account', 'queue-full'):
+            account_queue_full = True
+            return
         if status in ('queued', 'already-queued', 'already-requested', 'expanded'):
             queued_count += 1
             tracked_tasks.append({
@@ -2053,7 +2073,9 @@ def run_cycle(
             })
 
     def handle_leaves(batch: List[LeafCandidate]) -> None:
-        nonlocal queued_count, already_analyzed_count
+        nonlocal queued_count, already_analyzed_count, account_queue_full
+        if account_queue_full:
+            return
         if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
             return
 
@@ -2085,6 +2107,8 @@ def run_cycle(
                 singles.append(leaf)
 
         for leaf in singles:
+            if account_queue_full:
+                return
             if current_max_queue and current_max_queue > 0 and queued_count >= current_max_queue:
                 return
             handle_single_request(leaf)
@@ -2092,6 +2116,8 @@ def run_cycle(
         for parent_fen, parent_leaves in by_parent.items():
             idx = 0
             while idx < len(parent_leaves):
+                if account_queue_full:
+                    return
                 if current_max_queue and current_max_queue > 0:
                     remaining = current_max_queue - queued_count
                     if remaining <= 0:
@@ -2116,7 +2142,7 @@ def run_cycle(
                 skipped_list = resp.get('skipped')
 
                 if (
-                    top_status in ('refused', 'queue-full-account', 'http_error', 'error', 'already-solved')
+                    top_status in ('refused', 'queue-full-account', 'queue-full', 'http_error', 'error', 'already-solved')
                     or not isinstance(queued_list, list)
                     or not isinstance(skipped_list, list)
                 ):
@@ -2127,6 +2153,9 @@ def run_cycle(
                             explorer.known_analyzed_fens.add(leaf.fen)
                             already_analyzed_count += 1
                         print(f"     --> Status: {top_status:<15}{extra_str}\n")
+                    if top_status in ('queue-full-account', 'queue-full'):
+                        account_queue_full = True
+                        return
                     continue
 
                 queued_by_move = {
@@ -2225,8 +2254,13 @@ def run_cycle(
                             })
                         else:
                             print(f"     --> Status: {st:<15}\n")
+                            if st in ('queue-full', 'queue-full-account'):
+                                account_queue_full = True
                     else:
                         print(f"     --> Status: {top_status:<15}\n")
+
+                if account_queue_full:
+                    return
 
     leaves = explorer.explore(root_fen, on_leaves=handle_leaves)
 
@@ -2237,7 +2271,9 @@ def run_cycle(
         else:
             logger.info("No open leaf nodes queued (all discovered leaves already analyzed).")
 
-        if explorer.strategy == "target" and explorer.target_score is not None:
+        if account_queue_full:
+            logger.info("Account queue is full (queue-full-account); stopping requests for this cycle.")
+        elif explorer.strategy == "target" and explorer.target_score is not None:
             orig_target = explorer.target_score
             server_target_updated = False
             canon_root = canonicalize_fen(root_fen)
