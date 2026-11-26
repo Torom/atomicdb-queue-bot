@@ -93,6 +93,16 @@ def format_budget(nodes: int) -> str:
     return f"{nodes // 1_000_000}M"
 
 
+def format_pawns(score_cp: Optional[int], signed: bool = True) -> str:
+    """Formats a centipawn integer as a pawn string (e.g. -2032 -> '-20.32', 1980 -> '+19.80')."""
+    if score_cp is None:
+        return "N/A"
+    if score_cp == 0:
+        return "0.00"
+    pawns = score_cp / 100.0
+    return f"{pawns:+.2f}" if signed else f"{pawns:.2f}"
+
+
 def push_move_fen(board: chess.Board, move: chess.Move) -> str:
     """Applies `move` to a stackless copy of `board` and returns its canonicalized FEN."""
     board_copy = board.copy(stack=False)
@@ -1216,7 +1226,7 @@ class MinimaxFrontierExplorer:
 
             # 0 cp / loss check for existing nodes:
             if depth == 0 and self.skip_zero_cp and node_score is not None and node_score == 0:
-                logger.info("Root position has score 0 cp. With --skip-zero-cp, no tree will be explored.")
+                logger.info("Root position has score 0.00. With --skip-zero-cp, no tree will be explored.")
                 continue
 
             if not is_pv:
@@ -1295,7 +1305,7 @@ class MinimaxFrontierExplorer:
                     move_num = 1 + (depth + (1 if root_stm == 'b' else 0)) // 2
                     logger.info(
                         f"Preferring 50-move progress move '{sm_san}' over non-progress "
-                        f"best_move '{bm_san}' at move {move_num} (score {sm.get('score'):+d} cp)."
+                        f"best_move '{bm_san}' at move {move_num} (score {format_pawns(sm.get('score'))})."
                         if sm.get('score') is not None else
                         f"Preferring 50-move progress move '{sm_san}' over non-progress "
                         f"best_move '{bm_san}' at move {move_num}."
@@ -1774,7 +1784,7 @@ class MinimaxFrontierExplorer:
                     recovered.extend(sub_leaves)
                     logger.info(
                         f"50-move recovery: deepening alternative '{m_san}' at ply {att_depth} "
-                        f"(score {m_dict.get('score')} cp, Tier {tier}) yielded {len(sub_leaves)} leaf/leaves."
+                        f"(score {format_pawns(m_dict.get('score'))}, Tier {tier}) yielded {len(sub_leaves)} leaf/leaves."
                     )
                     break
 
@@ -2041,12 +2051,12 @@ def run_cycle(
     def emit_leaf_header(leaf: LeafCandidate) -> None:
         nonlocal leaf_idx
         leaf_idx += 1
-        score_str = f"{leaf.score:+d} cp" if leaf.score is not None else "N/A"
+        score_str = format_pawns(leaf.score)
         path_str = format_path_san(root_fen, leaf.path)
 
         logger.info(
             f"[Leaf #{leaf_idx:02d} found] Depth: {leaf.depth:2d} plies | "
-            f"Score: {score_str:>8} | Reason: {leaf.reason}"
+            f"Score: {score_str:>7} | Reason: {leaf.reason}"
         )
         wrapped = wrap_san_path(path_str)
         print(f"     Path: {wrapped[0]}")
@@ -2160,7 +2170,7 @@ def run_cycle(
         filtered: List[LeafCandidate] = []
         for leaf in batch:
             if explorer.skip_zero_cp and leaf.score is not None and leaf.score == 0:
-                logger.info(f"Skipping 0 cp leaf ({leaf.fen}).")
+                logger.info(f"Skipping 0.00 leaf ({leaf.fen}).")
                 continue
             filtered.append(leaf)
 
@@ -2370,8 +2380,8 @@ def run_cycle(
                     prev_target = explorer.target_score
                     explorer.target_score = local_target
                     logger.info(
-                        f"{log_prefix} Local root score reached {local_att:+d} cp "
-                        f"(>= target {prev_target:+d} cp); advancing pass target locally to {local_target:+d} cp."
+                        f"{log_prefix} Local root score reached {format_pawns(local_att)} "
+                        f"(>= target {format_pawns(prev_target)}); advancing pass target locally to {format_pawns(local_target)}."
                     )
                     return True
                 return False
@@ -2412,7 +2422,7 @@ def run_cycle(
                     )
                     _maybe_advance_local_target("[RE-BACKPROP]")
                     if _run_rebackprop_pass(
-                        f"[RE-BACKPROP] Exploring at {explorer.target_score:+d} cp (def-branch: {explorer.defender_branching})..."
+                        f"[RE-BACKPROP] Exploring at {format_pawns(explorer.target_score)} (def-branch: {explorer.defender_branching})..."
                     ) > 0:
                         break
 
@@ -2428,7 +2438,7 @@ def run_cycle(
                     else:
                         breaker_limit = max_queue
 
-                    stage_label = f"AND-width (def=unlimited, {explorer.margin_cp}cp)"
+                    stage_label = f"AND-width (def=unlimited, {format_pawns(explorer.margin_cp, signed=False)})"
                     try:
                         new_target = refresh_target_score(
                             client=client,
@@ -2442,19 +2452,19 @@ def run_cycle(
                             explorer.target_score = new_target
                             server_target_updated = True
                             logger.info(
-                                f"[BREAKER] Target updated to {new_target:+d} cp; "
+                                f"[BREAKER] Target updated to {format_pawns(new_target)}; "
                                 f"aborting breaker pass to restart from def-branch {orig_branching}."
                             )
                         else:
                             explorer.rebackprop_cache(root_fen)
                             if _maybe_advance_local_target("[RE-BACKPROP]"):
                                 _run_rebackprop_pass(
-                                    f"[RE-BACKPROP] Re-traversing at new local target {explorer.target_score:+d} cp "
+                                    f"[RE-BACKPROP] Re-traversing at new local target {format_pawns(explorer.target_score)} "
                                     f"with base settings (def-branch: {orig_branching})..."
                                 )
                             if queued_count == 0:
                                 logger.info(
-                                    f"[BREAKER] Saturated at {explorer.target_score:+d} cp. "
+                                    f"[BREAKER] Saturated at {format_pawns(explorer.target_score)}. "
                                     f"Trying {stage_label} "
                                     f"(max leaves: {breaker_limit if breaker_limit > 0 else 'unlimited'})..."
                                 )
@@ -2949,8 +2959,8 @@ def resolve_target_score(
             target = int(target_arg)
             if min_target is not None and target < min_target:
                 target = min_target
-                return target, f"advanced beyond root score: {target:+d} cp", None
-            return target, f"explicitly set to {target:+d} cp", None
+                return target, f"advanced beyond root score: {format_pawns(target)}", None
+            return target, f"explicitly set to {format_pawns(target)}", None
         except ValueError:
             logger.warning(f"Invalid --target-score value '{target_arg}'. Defaulting to 'auto'.")
 
@@ -2986,13 +2996,13 @@ def resolve_target_score(
             target = min_target
 
         if effective_record is not None and target == effective_record + 1:
-            return target, f"auto-fetched {source} {effective_record:+d} cp + 1 cp", rec
+            return target, f"auto-fetched {source} {format_pawns(effective_record)} + 0.01", rec
         else:
-            return target, f"auto-advanced beyond current root score: {target:+d} cp", rec
+            return target, f"auto-advanced beyond current root score: {format_pawns(target)}", rec
 
     # Fallback default
     target = min_target if min_target is not None else 1
-    return target, f"default advantage target: {target:+d} cp", None
+    return target, f"default advantage target: {format_pawns(target)}", None
 
 
 def refresh_target_score(
@@ -3018,7 +3028,7 @@ def refresh_target_score(
         if banner_pad:
             print()
         print("=" * 80)
-        print(f" 🏆 TARGET ACHIEVED! Root score reached {cur_score:+d} cp (Target was: {current_target:+d} cp) 🏆")
+        print(f" 🏆 TARGET ACHIEVED! Root score reached {format_pawns(cur_score)} (Target was: {format_pawns(current_target)}) 🏆")
         print("=" * 80 + ("\n" if banner_pad else ""))
         new_target, desc, _ = resolve_target_score(
             client=client,
@@ -3028,7 +3038,7 @@ def refresh_target_score(
             curr_score=raw_score,
             attacker_stm=eff_attacker
         )
-        logger.info(f"Advancing to next target: {new_target:+d} cp ({desc})\n")
+        logger.info(f"Advancing to next target: {format_pawns(new_target)} ({desc})\n")
         return new_target
 
     if target_arg.lower() == "auto":
@@ -3053,9 +3063,9 @@ def refresh_target_score(
             if banner_pad:
                 print()
             print("=" * 80)
-            print(f" 🏆 NEW RECORD IN /api/roots: {rec_val:+d} cp (Previous target was: {current_target:+d} cp) 🏆")
+            print(f" 🏆 NEW RECORD IN /api/roots: {format_pawns(rec_val)} (Previous target was: {format_pawns(current_target)}) 🏆")
             print("=" * 80 + ("\n" if banner_pad else ""))
-            logger.info(f"Advancing to next target: {fresh_target:+d} cp ({fresh_desc})\n")
+            logger.info(f"Advancing to next target: {format_pawns(fresh_target)} ({fresh_desc})\n")
             return fresh_target
 
     return None
@@ -3116,8 +3126,8 @@ def main():
         moves_san_display = chess.variant.AtomicBoard(args.fen).variation_san(parsed_root_moves)
 
     min_score_display = (
-        f"{args.min_score} cp (explicit)" if args.min_score is not None
-        else "Auto (>= 1 cp if winning, unrestricted if <= 0 cp)"
+        f"{format_pawns(args.min_score)} (explicit)" if args.min_score is not None
+        else "Auto (>= +0.01 if winning, unrestricted if <= 0.00)"
     )
 
     username, password, auth_source = resolve_credentials(args.username, args.password)
@@ -3134,7 +3144,7 @@ def main():
     if args.attacker != "auto":
         att_desc = f"explicit --attacker {args.attacker}"
     elif init_att_score is not None:
-        att_desc = f"auto from root score: {init_att_score:+d} cp"
+        att_desc = f"auto from root score: {format_pawns(init_att_score)}"
     else:
         att_desc = "default White (root score unavailable)"
 
@@ -3157,10 +3167,10 @@ def main():
     print("                     ATOMICDB MINIMAX QUEUE BOT                                 ")
     print("================================================================================")
     print(f" Server     : {args.server}")
-    margin_display = f"margin: {eff_margin_cp} cp" if eff_margin_cp > 0 else "strict best move"
+    margin_display = f"margin: {format_pawns(eff_margin_cp, signed=False)}" if eff_margin_cp > 0 else "strict best move"
     print(f" Strategy   : {args.strategy.upper()} ({margin_display})")
     if args.strategy == "target" and target_score is not None:
-        print(f" Target     : {target_score:+d} cp for {attacker_name} ({target_desc})")
+        print(f" Target     : {format_pawns(target_score)} for {attacker_name} ({target_desc})")
     print(f" Root FEN   : {effective_root_fen} ({stm_name} to move)")
     print(f" Attacker   : {attacker_name} (OR) vs {'Black' if attacker_stm == 'w' else 'White'} (AND) [{att_desc}]")
     if moves_san_display:
@@ -3178,7 +3188,7 @@ def main():
         breaker_max_str = "Unlimited" if args.breaker_max_leaves == 0 else str(args.breaker_max_leaves)
         print(f" Breaker Max: {breaker_max_str} leaves per breaker pass")
     print(f" Max Depth  : {depth_str} | No-Progress: {no_prog_str} | Max Leaves: {leaves_str}")
-    print(f" 0 cp Filter: {'Active (skip 0 cp / draw)' if args.skip_zero_cp else 'Inactive'} | Min Score: {min_score_display}")
+    print(f" 0.00 Filter: {'Active (skip 0.00 / draw)' if args.skip_zero_cp else 'Inactive'} | Min Score: {min_score_display}")
     print(f" Budget     : {b_label}")
     print(f" Mode       : {args.mode.upper()}" + (f" (polling: every {args.poll_interval}s)" if args.mode == "loop" else ""))
     print(f" Dry Run    : {args.dry_run}")
@@ -3205,7 +3215,7 @@ def main():
     if args.strategy == "target" and target_score is not None:
         if init_att_score is not None and init_att_score >= target_score:
             print("=" * 80)
-            print(f" 🏆 TARGET ALREADY ACHIEVED! Root score is {init_att_score:+d} cp (Target was: {target_score:+d} cp) 🏆")
+            print(f" 🏆 TARGET ALREADY ACHIEVED! Root score is {format_pawns(init_att_score)} (Target was: {format_pawns(target_score)}) 🏆")
             print("=" * 80)
             target_score, target_desc, _ = resolve_target_score(
                 client=client,
@@ -3216,7 +3226,7 @@ def main():
                 attacker_stm=attacker_stm
             )
             explorer.target_score = target_score
-            logger.info(f"Advancing to next target: {target_score:+d} cp ({target_desc})\n")
+            logger.info(f"Advancing to next target: {format_pawns(target_score)} ({target_desc})\n")
 
     try:
         if args.mode == "once":
