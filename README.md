@@ -184,7 +184,7 @@ You can anchor the search at any line or defense variation:
 | `--max-leaves` | `0` | Max leaves to queue per cycle (`0` = unlimited) |
 | `--breaker-max-leaves` | `32` | Max leaves to queue per breaker pass in `target` mode (`0` = unlimited) |
 | `--max-queries` | `0` | Max API queries per cycle (`0` = unlimited) |
-| `--skip-zero-cp` | `True` | Skip 0 cp positions (draws / perpetuals) and do not queue them |
+| `--skip-zero-cp` | `Auto` | Skip 0 cp positions (draws / perpetuals; auto `True` when target > 0, `False` when target <= 0) |
 | `--min-score` | `Auto` | Minimum score for attacker moves (`>= 1 cp` if winning, unrestricted if `<= 0 cp`) |
 | `--budget` | `128000000` | Node budget for analysis tasks (default: 128M) |
 | `--mode` | `loop` | Operating mode: `once` (single run) or `loop` (reactive daemon) |

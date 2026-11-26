@@ -1364,6 +1364,11 @@ class MinimaxFrontierExplorer:
                     no_progress_events.append((depth, last_progress_depth, path, is_pv))
                     continue
 
+                target_is_non_positive = (
+                    self.strategy == "target"
+                    and self.target_score is not None
+                    and self.target_score <= 0
+                )
                 if stm != attacker_stm:
                     # Defender forces a draw by repetition (0 cp).
                     # In minimax, a losing defender chooses a draw over losing non-cyclic moves.
@@ -1373,11 +1378,20 @@ class MinimaxFrontierExplorer:
                         f"Repetition at depth {depth}: Defender forces draw via "
                         f"{moves_str} -> branch discarded."
                     )
-                    if len(path) >= 1:
+                    if not target_is_non_positive and len(path) >= 1:
                         # Inspect attacker nodes from recent moves (within the cycle range)
                         for p_len in range(len(path) - 1, max(0, len(path) - 16), -1):
                             if p_len % 2 == attacker_parity:
                                 cycle_attacker_events.append((p_len, path[:p_len]))
+                    continue
+
+                if target_is_non_positive:
+                    # Repetition (0.00) already satisfies target <= 0.00 -> accept draw, do not diverge.
+                    moves_str = ", ".join(move_to_san(board, m.get('uci')) for m in selected_moves)
+                    logger.info(
+                        f"Repetition at depth {depth}: {moves_str} achieves 0.00 draw "
+                        f"(meets target {format_pawns(self.target_score)}) -> branch closed."
+                    )
                     continue
 
                 # Only the attacker (stm == attacker_stm) diverges to non-cyclic alternatives
@@ -2886,8 +2900,8 @@ def parse_arguments():
     parser.add_argument(
         "--skip-zero-cp",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip 0 cp positions (draw / perpetual) and do not queue them as leaves (default: True)"
+        default=None,
+        help="Skip 0 cp positions (draw / perpetual) and do not queue them as leaves (default: auto — True when target > 0, False when target <= 0)"
     )
     parser.add_argument(
         "--min-score",
@@ -3163,6 +3177,17 @@ def main():
     eff_margin_cp = 10 if (args.strategy == "margin" and args.margin_cp == 0) else args.margin_cp
     eff_defender_branching = args.defender_branching
 
+    def _resolve_skip_zero_cp(curr_target: Optional[int]) -> bool:
+        if args.skip_zero_cp is not None:
+            return args.skip_zero_cp
+        return not (
+            args.strategy == "target"
+            and curr_target is not None
+            and curr_target <= 0
+        )
+
+    eff_skip_zero_cp = _resolve_skip_zero_cp(target_score)
+
     print("================================================================================")
     print("                     ATOMICDB MINIMAX QUEUE BOT                                 ")
     print("================================================================================")
@@ -3188,7 +3213,13 @@ def main():
         breaker_max_str = "Unlimited" if args.breaker_max_leaves == 0 else str(args.breaker_max_leaves)
         print(f" Breaker Max: {breaker_max_str} leaves per breaker pass")
     print(f" Max Depth  : {depth_str} | No-Progress: {no_prog_str} | Max Leaves: {leaves_str}")
-    print(f" 0.00 Filter: {'Active (skip 0.00 / draw)' if args.skip_zero_cp else 'Inactive'} | Min Score: {min_score_display}")
+    if eff_skip_zero_cp:
+        zero_filter_str = "Active (skip 0.00 / draw)"
+    elif args.skip_zero_cp is None:
+        zero_filter_str = "Inactive (auto-disabled for target <= 0.00)"
+    else:
+        zero_filter_str = "Inactive"
+    print(f" 0.00 Filter: {zero_filter_str} | Min Score: {min_score_display}")
     print(f" Budget     : {b_label}")
     print(f" Mode       : {args.mode.upper()}" + (f" (polling: every {args.poll_interval}s)" if args.mode == "loop" else ""))
     print(f" Dry Run    : {args.dry_run}")
@@ -3206,7 +3237,7 @@ def main():
         max_depth=args.max_depth,
         max_leaves=args.max_leaves,
         max_queries=args.max_queries,
-        skip_zero_cp=args.skip_zero_cp,
+        skip_zero_cp=eff_skip_zero_cp,
         min_score=args.min_score,
         max_no_progress=args.max_no_progress,
         attacker_stm=attacker_stm
@@ -3226,6 +3257,7 @@ def main():
                 attacker_stm=attacker_stm
             )
             explorer.target_score = target_score
+            explorer.skip_zero_cp = _resolve_skip_zero_cp(target_score)
             logger.info(f"Advancing to next target: {format_pawns(target_score)} ({target_desc})\n")
 
     try:
@@ -3267,6 +3299,7 @@ def main():
                         if new_target is not None:
                             target_score = new_target
                             explorer.target_score = new_target
+                            explorer.skip_zero_cp = _resolve_skip_zero_cp(new_target)
 
                     tracked_tasks = run_cycle(
                         client=client,
@@ -3282,6 +3315,7 @@ def main():
 
                     if explorer.strategy == "target" and explorer.target_score is not None and target_score != explorer.target_score:
                         target_score = explorer.target_score
+                        explorer.skip_zero_cp = _resolve_skip_zero_cp(target_score)
                         if not tracked_tasks and not args.dry_run:
                             continue
 
