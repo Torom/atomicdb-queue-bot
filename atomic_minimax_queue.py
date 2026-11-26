@@ -3275,15 +3275,6 @@ def main():
             )
         else:
             logger.info("Starting reactive monitoring loop...")
-            if not args.dry_run:
-                try:
-                    _wait_for_existing_user_queue(
-                        client, args.poll_interval, args.max_wait,
-                        "Found {count} active task(s) in 'my-queue'. Waiting for cycle trigger..."
-                    )
-                except KeyboardInterrupt:
-                    logger.info("Terminated by user.")
-                    return
 
             while True:
                 try:
