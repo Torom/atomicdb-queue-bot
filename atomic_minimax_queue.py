@@ -1284,13 +1284,15 @@ class MinimaxFrontierExplorer:
                 continue
 
             # Select moves to follow according to chosen strategy
+            defender_overflow: List[dict] = []
             selected_moves = self._select_moves(
                 stm, moves, best_move,
                 attacker_stm=attacker_stm,
                 node_score=node_score,
                 effective_min_score=effective_min_score,
                 is_pv=is_pv,
-                board=board
+                board=board,
+                overflow_out=defender_overflow,
             )
 
             if not selected_moves:
@@ -1317,7 +1319,8 @@ class MinimaxFrontierExplorer:
             valid_candidates = []
             repeated_fens = []
             no_progress_hits = []
-            for m in selected_moves:
+
+            def _eval_candidate(m: dict) -> Optional[Tuple[dict, str, int, int]]:
                 uci = m['uci']
                 try:
                     move_obj = chess.Move.from_uci(uci)
@@ -1326,20 +1329,25 @@ class MinimaxFrontierExplorer:
                     child_fen = push_move_fen(board, move_obj)
                 except Exception as ex:
                     logger.warning(f"Could not execute move {move_to_san(board, uci)} on {fen}: {ex}")
-                    continue
+                    return None
 
                 if child_fen in path_fens:
                     repeated_fens.append(child_fen)
                     logger.debug(f"Move {move_san} leads to repetition (position already on path).")
-                    continue
+                    return None
 
                 new_no_progress = 0 if is_prog else (no_progress_plies + 1)
                 if enforce_no_progress and new_no_progress >= self.max_no_progress:
                     no_progress_hits.append((m, child_fen))
-                    continue
+                    return None
 
                 new_last_prog_depth = (depth + 1) if is_prog else last_progress_depth
-                valid_candidates.append((m, child_fen, new_no_progress, new_last_prog_depth))
+                return (m, child_fen, new_no_progress, new_last_prog_depth)
+
+            for m in selected_moves:
+                cand = _eval_candidate(m)
+                if cand is not None:
+                    valid_candidates.append(cand)
 
             if no_progress_hits:
                 pv_hit_here = is_pv and (
@@ -1499,12 +1507,17 @@ class MinimaxFrontierExplorer:
                             f"Repetition at depth {depth}: Attacker has no non-cyclic exits left -> branch discarded."
                         )
 
-            node_leaves: List[LeafCandidate] = []
-            for m, child_fen, new_no_progress, new_last_prog_depth in valid_candidates:
+            def _dispatch_candidate(
+                m: dict,
+                child_fen: str,
+                new_no_progress: int,
+                new_last_prog_depth: int,
+                out_leaves: List[LeafCandidate],
+                allow_primary_pv_flag: bool = True,
+            ) -> str:
                 uci = m['uci']
                 move_visits = self._resolve_effective_visits(m, child_fen)
                 move_score = m.get('score')
-                move_backed = m.get('backed_plies', 0)
                 new_path = path + [uci]
                 new_path_fens = path_fens | {child_fen}
                 new_depth = depth + 1
@@ -1513,13 +1526,15 @@ class MinimaxFrontierExplorer:
                 is_borrowed = bool(m.get('borrowed', False))
 
                 # 0 cp and min-score check for follow-up moves
-                is_primary_pv = m.get('_is_preferred_pv', False) or (best_move is not None and uci == best_move)
+                is_primary_pv = allow_primary_pv_flag and (
+                    m.get('_is_preferred_pv', False) or (best_move is not None and uci == best_move)
+                )
                 child_is_pv = is_pv and is_primary_pv
                 if not child_is_pv:
                     if self.skip_zero_cp and move_score is not None and move_score == 0:
-                        continue
+                        return 'filtered'
                     if effective_min_score is not None and stm == attacker_stm and move_score is not None and move_score < effective_min_score:
-                        continue
+                        return 'filtered'
 
                 # Branch priority calculation (Best-First / depth-first along PV):
                 # 1. Deeper nodes first (factor -new_depth * 1000.0) -> advances to PV head immediately
@@ -1548,7 +1563,7 @@ class MinimaxFrontierExplorer:
                                 is_primary_pv
                                 and (node_score is None or node_score > -self.target_score)
                             ):
-                                continue
+                                return 'filtered'
 
                         # 2. Attacker (stm == attacker_stm) made the move to this leaf: Attacker score is move_score.
                         # Only prune a move that meets target if this parent node already accepts >= target_score
@@ -1560,11 +1575,11 @@ class MinimaxFrontierExplorer:
                             and node_score >= self.target_score
                             and move_score >= self.target_score
                         ):
-                            continue
+                            return 'filtered'
 
                     if child_fen not in seen_leaves:
                         if max_leaves_limit > 0 and len(leaves) >= max_leaves_limit:
-                            break
+                            return 'limit'
                         seen_leaves.add(child_fen)
                         if m.get('_is_cycle_exit'):
                             reason_str = 'cycle_exit'
@@ -1582,14 +1597,48 @@ class MinimaxFrontierExplorer:
                             priority=child_priority
                         )
                         leaves.append(leaf)
-                        node_leaves.append(leaf)
+                        out_leaves.append(leaf)
+                        return 'leaf'
+                    return 'filtered'
                 else:
                     heappush(
                         frontier,
                         (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv, new_no_progress, new_last_prog_depth, fen)
                     )
+                    return 'pushed_visited' if move_visits > 0 else 'pushed_known'
+
+            node_leaves: List[LeafCandidate] = []
+            for m, child_fen, new_no_progress, new_last_prog_depth in valid_candidates:
+                status_res = _dispatch_candidate(m, child_fen, new_no_progress, new_last_prog_depth, node_leaves)
+                if status_res == 'limit':
+                    break
 
             self._emit_leaves(node_leaves, on_leaf, on_leaves)
+
+            # Refill AND-node branching slots that immediately came back as already-analyzed
+            refill_needed = sum(1 for l in node_leaves if l.fen in self.known_analyzed_fens)
+            while stm != attacker_stm and self.defender_branching > 0 and refill_needed > 0 and defender_overflow:
+                refill_leaves: List[LeafCandidate] = []
+                slots_left = refill_needed
+                hit_limit = False
+                while slots_left > 0 and defender_overflow:
+                    m_extra = defender_overflow.pop(0)
+                    cand = _eval_candidate(m_extra)
+                    if cand is None:
+                        continue
+                    status_res = _dispatch_candidate(*cand, refill_leaves, allow_primary_pv_flag=False)
+                    if status_res == 'limit':
+                        hit_limit = True
+                        break
+                    if status_res in ('leaf', 'pushed_visited'):
+                        slots_left -= 1
+                if refill_leaves:
+                    self._emit_leaves(refill_leaves, on_leaf, on_leaves)
+                    refill_needed = sum(1 for l in refill_leaves if l.fen in self.known_analyzed_fens)
+                else:
+                    break
+                if hit_limit:
+                    break
 
         return leaves, effective_min_score, min_score_initialized
 
@@ -1862,9 +1911,32 @@ class MinimaxFrontierExplorer:
         node_score: Optional[int] = None,
         effective_min_score: Optional[int] = None,
         is_pv: bool = False,
-        board: Optional[chess.variant.AtomicBoard] = None
+        board: Optional[chess.variant.AtomicBoard] = None,
+        overflow_out: Optional[List[dict]] = None,
     ) -> List[dict]:
         """Selects moves relevant for minimax/solving based on strategy."""
+        def _is_known_analyzed_zero_visit(m: dict) -> bool:
+            if m.get('visits', 0) != 0 or board is None or not m.get('uci'):
+                return False
+            try:
+                child_fen = push_move_fen(board, chess.Move.from_uci(m['uci']))
+                return child_fen in self.known_analyzed_fens
+            except Exception:
+                return False
+
+        def _select_with_refill(sorted_cands: List[dict], limit: int) -> Tuple[List[dict], List[dict]]:
+            chosen: List[dict] = []
+            overflow: List[dict] = []
+            active = 0
+            for cand in sorted_cands:
+                if _is_known_analyzed_zero_visit(cand):
+                    chosen.append(cand)
+                elif active < limit:
+                    chosen.append(cand)
+                    active += 1
+                else:
+                    overflow.append(cand)
+            return chosen, overflow
         scored_moves = [
             m for m in moves
             if m.get('score') is not None and not m.get('floor', False)
@@ -1986,9 +2058,11 @@ class MinimaxFrontierExplorer:
 
                 candidates.sort(key=lambda m: (m['score'], 0 if m.get('borrowed', False) else 1), reverse=True)
                 def_branch = self.defender_branching if self.defender_branching > 0 else len(candidates)
-                selected = candidates[:def_branch]
+                selected, overflow = _select_with_refill(candidates, def_branch)
                 if is_pv and bm_m and bm_m not in selected:
                     selected.append(bm_m)
+                if overflow_out is not None and overflow:
+                    overflow_out.extend(m for m in overflow if m not in selected)
         elif self.strategy == "exact":
             # Strict best score
             selected = [
@@ -2014,7 +2088,10 @@ class MinimaxFrontierExplorer:
                 if self.skip_zero_cp:
                     unsolved = [m for m in unsolved if m.get('score') != 0]
                 unsolved.sort(key=lambda m: (m.get('score') is not None, m.get('score', -99999)), reverse=True)
-                selected = unsolved[:self.defender_branching]
+                def_branch = self.defender_branching if self.defender_branching > 0 else len(unsolved)
+                selected, overflow = _select_with_refill(unsolved, def_branch)
+                if overflow_out is not None and overflow:
+                    overflow_out.extend(overflow)
         else:
             # Default / Top-K
             selected = [
