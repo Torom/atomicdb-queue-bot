@@ -2200,13 +2200,16 @@ def run_cycle(
         task_state = resp.get('task_state')
 
         # Response to only_if_missing: Position already analyzed with >= budget
-        if status in ('already-analyzed', 'already-solved'):
+        if status in ('already-analyzed', 'closed', 'already-solved', 'ladder-spent'):
             explorer.known_analyzed_fens.add(leaf.fen)
             already_analyzed_count += 1
             client.query(leaf.fen, bypass_cache=True)
             completed_budget = resp.get('completed_budget')
-            b_label = format_budget(completed_budget) if completed_budget else "?"
-            print(f"     --> Status: {status} (already analyzed with {b_label} nodes)\n")
+            if completed_budget:
+                b_label = format_budget(completed_budget)
+                print(f"     --> Status: {status} (already analyzed with {b_label} nodes)\n")
+            else:
+                print(f"     --> Status: {status}\n")
             return
 
         # Emergency safety net AFTER request:
@@ -2307,6 +2310,10 @@ def run_cycle(
 
                 chunk = parent_leaves[idx:idx + chunk_size]
                 idx += len(chunk)
+
+                if len(chunk) == 1:
+                    handle_single_request(chunk[0])
+                    continue
 
                 select_ucis = [l.path[-1].lower() for l in chunk]
                 resp = client.request_children(
