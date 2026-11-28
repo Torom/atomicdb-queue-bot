@@ -1151,39 +1151,56 @@ class MinimaxFrontierExplorer:
         """Executes priority-queue minimax traversal from initial_nodes and returns discovered leaves."""
         attacker_parity = 0 if attacker_stm == root_stm else 1
         leaves: List[LeafCandidate] = []
-        frontier: List[Tuple[float, int, List[str], Set[str], str, bool, int, int, str]] = []
-        for node in initial_nodes:
-            heappush(frontier, node)
+        frontier: List[Tuple[float, int, List[str], Set[str], str, bool, int, int, str, int, Tuple[dict, ...]]] = []
+        push_seq = 0
 
-        last_logged_query = self.client.query_count
-        while frontier:
-            if max_leaves_limit > 0 and len(leaves) >= max_leaves_limit:
-                logger.info(f"Max leaves limit ({max_leaves_limit}) reached. Terminating traversal early.")
-                break
+        def _push_frontier(
+            item: Tuple[float, int, List[str], Set[str], str, bool, int, int, str],
+            tokens: Tuple[dict, ...],
+        ) -> None:
+            nonlocal push_seq
+            for tok in tokens:
+                tok['open_nodes'] += 1
+            push_seq += 1
+            heappush(frontier, (*item, push_seq, tokens))
 
-            if self.max_queries > 0 and self.client.query_count >= self.max_queries:
-                logger.info(f"Max queries limit ({self.max_queries}) reached for this cycle.")
-                break
+        def _mark_tokens_work(tokens: Tuple[dict, ...]) -> None:
+            for tok in tokens:
+                tok['found_work'] = True
 
-            if self.client.query_count - last_logged_query >= 20 and self.client.query_count > 0:
-                last_logged_query = self.client.query_count
-                curr_depth = frontier[0][1] if frontier else 0
-                logger.info(
-                    f"Traversing: {self.client.query_count} queries | "
-                    f"{len(leaves)} leaves queued | Depth: {curr_depth} plies | "
-                    f"Open nodes: {len(frontier)}"
-                )
+        def _release_tokens(tokens: Tuple[dict, ...]) -> None:
+            for tok in reversed(tokens):
+                tok['open_nodes'] -= 1
+                if (
+                    tok['open_nodes'] == 0
+                    and not tok['found_work']
+                    and not (max_leaves_limit > 0 and len(leaves) >= max_leaves_limit)
+                    and not (self.max_queries > 0 and self.client.query_count >= self.max_queries)
+                ):
+                    tok['refill_one']()
 
-            priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth, parent_fen_str = heappop(frontier)
+        def _step_node(
+            priority: float,
+            depth: int,
+            path: List[str],
+            path_fens: Set[str],
+            fen: str,
+            is_pv: bool,
+            no_progress_plies: int,
+            last_progress_depth: int,
+            parent_fen_str: str,
+            branch_tokens: Tuple[dict, ...],
+        ) -> None:
+            nonlocal effective_min_score, min_score_initialized
 
             if self.max_depth > 0 and depth > self.max_depth:
-                continue
+                return
 
             if depth > 0 and self._is_no_progress_draw_active(effective_min_score) and no_progress_plies >= self.max_no_progress:
-                continue
+                return
 
             if fen in visited_nodes:
-                continue
+                return
             visited_nodes.add(fen)
 
             data = self.client.query(fen)
@@ -1202,12 +1219,14 @@ class MinimaxFrontierExplorer:
                     )
                     leaves.append(leaf)
                     self._emit_leaves([leaf], on_leaf, on_leaves)
-                continue
+                    if leaf.fen not in self.known_analyzed_fens:
+                        _mark_tokens_work(branch_tokens)
+                return
 
             status = data.get('status', 'UNKNOWN')
             if status != 'UNKNOWN':
                 # Already proven (WHITE_WIN, BLACK_WIN, DRAW) -> branch closed/solved!
-                continue
+                return
 
             # Side to move
             stm = fen.split()[1] if len(fen.split()) > 1 else 'w'
@@ -1227,22 +1246,22 @@ class MinimaxFrontierExplorer:
             # 0 cp / loss check for existing nodes:
             if depth == 0 and self.skip_zero_cp and node_score is not None and node_score == 0:
                 logger.info("Root position has score 0.00. With --skip-zero-cp, no tree will be explored.")
-                continue
+                return
 
             if not is_pv:
                 if self.skip_zero_cp and node_score is not None and node_score == 0:
-                    continue
+                    return
                 if effective_min_score is not None and node_score is not None and stm == attacker_stm and node_score < effective_min_score:
-                    continue
+                    return
 
             if visits == 0:
                 # Position exists in DB but has 0 visits -> leaf node!
                 if fen in self.known_analyzed_fens:
-                    continue
+                    return
                 if self.skip_zero_cp and node_score is not None and node_score == 0:
-                    continue
+                    return
                 if effective_min_score is not None and stm == attacker_stm and node_score is not None and node_score < effective_min_score:
-                    continue
+                    return
 
                 # In target strategy, evaluate the leaf strictly against the target score:
                 if self.strategy == "target" and self.target_score is not None and node_score is not None:
@@ -1252,10 +1271,10 @@ class MinimaxFrontierExplorer:
                         # If the leaf score already suffices for target (Attacker >= target), do not queue!
                         # 1. Attacker (stm == attacker_stm): Attacker score is node_score
                         if stm == attacker_stm and node_score >= self.target_score:
-                            continue
+                            return
                         # 2. Defender (stm != attacker_stm): Attacker score is -node_score (>= target iff node_score <= -target)
                         if stm != attacker_stm and node_score <= -self.target_score:
-                            continue
+                            return
 
                 if fen not in seen_leaves:
                     seen_leaves.add(fen)
@@ -1270,18 +1289,20 @@ class MinimaxFrontierExplorer:
                     )
                     leaves.append(leaf)
                     self._emit_leaves([leaf], on_leaf, on_leaves)
-                continue
+                    if leaf.fen not in self.known_analyzed_fens:
+                        _mark_tokens_work(branch_tokens)
+                return
 
             if not moves:
                 # Position already has visits (>0) but no legal follow-up moves (terminal/dead end)
-                continue
+                return
 
             # Build board before move selection so attacker ties can prefer 50-move-resetting moves
             try:
                 board = chess.variant.AtomicBoard(fen)
             except Exception as e:
                 logger.error(f"Invalid FEN {fen}: {e}")
-                continue
+                return
 
             # Select moves to follow according to chosen strategy
             defender_overflow: List[dict] = []
@@ -1298,7 +1319,7 @@ class MinimaxFrontierExplorer:
             if not selected_moves:
                 if self.strategy == "target" and stm != attacker_stm:
                     logger.debug(f"Branch secured at depth {depth}: all defender responses meet target score.")
-                continue
+                return
 
             for sm in selected_moves:
                 if sm.get('_is_preferred_pv') and best_move and sm.get('uci') != best_move:
@@ -1360,7 +1381,7 @@ class MinimaxFrontierExplorer:
                         f"No-progress limit ({self.max_no_progress} plies) reached at depth {depth} "
                         f"(since ply {last_progress_depth}) -> branch treated as 50-move draw."
                     )
-                    continue
+                    return
 
             # If ALL selected moves lead to a repetition (draw):
             if not valid_candidates:
@@ -1370,7 +1391,7 @@ class MinimaxFrontierExplorer:
                         f"(since ply {last_progress_depth}) -> deferred to progress recovery."
                     )
                     no_progress_events.append((depth, last_progress_depth, path, is_pv))
-                    continue
+                    return
 
                 target_is_non_positive = (
                     self.strategy == "target"
@@ -1391,7 +1412,7 @@ class MinimaxFrontierExplorer:
                         for p_len in range(len(path) - 1, max(0, len(path) - 16), -1):
                             if p_len % 2 == attacker_parity:
                                 cycle_attacker_events.append((p_len, path[:p_len]))
-                    continue
+                    return
 
                 if target_is_non_positive:
                     # Repetition (0.00) already satisfies target <= 0.00 -> accept draw, do not diverge.
@@ -1400,7 +1421,7 @@ class MinimaxFrontierExplorer:
                         f"Repetition at depth {depth}: {moves_str} achieves 0.00 draw "
                         f"(meets target {format_pawns(self.target_score)}) -> branch closed."
                     )
-                    continue
+                    return
 
                 # Only the attacker (stm == attacker_stm) diverges to non-cyclic alternatives
                 # to avoid a draw and prove a real win (> 0 cp):
@@ -1507,6 +1528,41 @@ class MinimaxFrontierExplorer:
                             f"Repetition at depth {depth}: Attacker has no non-cyclic exits left -> branch discarded."
                         )
 
+            subtree_refills_left = self.defender_branching
+
+            def _refill_one() -> None:
+                nonlocal subtree_refills_left
+                if subtree_refills_left <= 0:
+                    return
+                while (
+                    defender_overflow
+                    and subtree_refills_left > 0
+                    and not (max_leaves_limit > 0 and len(leaves) >= max_leaves_limit)
+                    and not (self.max_queries > 0 and self.client.query_count >= self.max_queries)
+                ):
+                    m_extra = defender_overflow.pop(0)
+                    cand = _eval_candidate(m_extra)
+                    if cand is None:
+                        continue
+                    refill_batch: List[LeafCandidate] = []
+                    st_res = _dispatch_candidate(
+                        *cand,
+                        refill_batch,
+                        allow_primary_pv_flag=False,
+                        attach_and_token=(subtree_refills_left > 1 and bool(defender_overflow)),
+                    )
+                    if st_res == 'limit':
+                        return
+                    if st_res == 'pushed_visited':
+                        subtree_refills_left -= 1
+                        return
+                    if st_res == 'leaf' and refill_batch:
+                        self._emit_leaves(refill_batch, on_leaf, on_leaves)
+                        if any(l.fen not in self.known_analyzed_fens for l in refill_batch):
+                            subtree_refills_left -= 1
+                            _mark_tokens_work(branch_tokens)
+                            return
+
             def _dispatch_candidate(
                 m: dict,
                 child_fen: str,
@@ -1514,6 +1570,7 @@ class MinimaxFrontierExplorer:
                 new_last_prog_depth: int,
                 out_leaves: List[LeafCandidate],
                 allow_primary_pv_flag: bool = True,
+                attach_and_token: bool = False,
             ) -> str:
                 uci = m['uci']
                 move_visits = self._resolve_effective_visits(m, child_fen)
@@ -1601,19 +1658,42 @@ class MinimaxFrontierExplorer:
                         return 'leaf'
                     return 'filtered'
                 else:
-                    heappush(
-                        frontier,
-                        (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv, new_no_progress, new_last_prog_depth, fen)
+                    has_unconfirmed_ancestor = any(not t['found_work'] for t in branch_tokens)
+                    if (
+                        attach_and_token
+                        and not has_unconfirmed_ancestor
+                        and stm != attacker_stm
+                        and self.defender_branching > 0
+                        and subtree_refills_left > 0
+                        and defender_overflow
+                        and move_visits > 0
+                    ):
+                        tok = {'open_nodes': 0, 'found_work': False, 'refill_one': _refill_one}
+                        child_tokens = branch_tokens + (tok,)
+                    else:
+                        child_tokens = branch_tokens
+                    _push_frontier(
+                        (child_priority, new_depth, new_path, new_path_fens, child_fen, child_is_pv, new_no_progress, new_last_prog_depth, fen),
+                        child_tokens,
                     )
                     return 'pushed_visited' if move_visits > 0 else 'pushed_known'
 
             node_leaves: List[LeafCandidate] = []
             for m, child_fen, new_no_progress, new_last_prog_depth in valid_candidates:
-                status_res = _dispatch_candidate(m, child_fen, new_no_progress, new_last_prog_depth, node_leaves)
+                status_res = _dispatch_candidate(
+                    m,
+                    child_fen,
+                    new_no_progress,
+                    new_last_prog_depth,
+                    node_leaves,
+                    attach_and_token=True,
+                )
                 if status_res == 'limit':
                     break
 
             self._emit_leaves(node_leaves, on_leaf, on_leaves)
+            if any(l.fen not in self.known_analyzed_fens for l in node_leaves):
+                _mark_tokens_work(branch_tokens)
 
             # Refill AND-node branching slots that immediately came back as already-analyzed
             refill_needed = sum(1 for l in node_leaves if l.fen in self.known_analyzed_fens)
@@ -1626,7 +1706,12 @@ class MinimaxFrontierExplorer:
                     cand = _eval_candidate(m_extra)
                     if cand is None:
                         continue
-                    status_res = _dispatch_candidate(*cand, refill_leaves, allow_primary_pv_flag=False)
+                    status_res = _dispatch_candidate(
+                        *cand,
+                        refill_leaves,
+                        allow_primary_pv_flag=False,
+                        attach_and_token=bool(defender_overflow),
+                    )
                     if status_res == 'limit':
                         hit_limit = True
                         break
@@ -1634,11 +1719,44 @@ class MinimaxFrontierExplorer:
                         slots_left -= 1
                 if refill_leaves:
                     self._emit_leaves(refill_leaves, on_leaf, on_leaves)
+                    if any(l.fen not in self.known_analyzed_fens for l in refill_leaves):
+                        _mark_tokens_work(branch_tokens)
                     refill_needed = sum(1 for l in refill_leaves if l.fen in self.known_analyzed_fens)
                 else:
                     break
                 if hit_limit:
                     break
+
+        for node in initial_nodes:
+            _push_frontier(node, ())
+
+        last_logged_query = self.client.query_count
+        while frontier:
+            if max_leaves_limit > 0 and len(leaves) >= max_leaves_limit:
+                logger.info(f"Max leaves limit ({max_leaves_limit}) reached. Terminating traversal early.")
+                break
+
+            if self.max_queries > 0 and self.client.query_count >= self.max_queries:
+                logger.info(f"Max queries limit ({self.max_queries}) reached for this cycle.")
+                break
+
+            if self.client.query_count - last_logged_query >= 20 and self.client.query_count > 0:
+                last_logged_query = self.client.query_count
+                curr_depth = frontier[0][1] if frontier else 0
+                logger.info(
+                    f"Traversing: {self.client.query_count} queries | "
+                    f"{len(leaves)} leaves queued | Depth: {curr_depth} plies | "
+                    f"Open nodes: {len(frontier)}"
+                )
+
+            priority, depth, path, path_fens, fen, is_pv, no_progress_plies, last_progress_depth, parent_fen_str, _seq, branch_tokens = heappop(frontier)
+            try:
+                _step_node(
+                    priority, depth, path, path_fens, fen, is_pv,
+                    no_progress_plies, last_progress_depth, parent_fen_str, branch_tokens,
+                )
+            finally:
+                _release_tokens(branch_tokens)
 
         return leaves, effective_min_score, min_score_initialized
 
